@@ -11,7 +11,7 @@
 
 打开会话记录中的 `...` 菜单，在“归档会话”下面点击“删除会话”，即可删除当前会话。
 
-![会话菜单中的删除会话](docs/images/session-menu-delete.svg)
+![会话菜单中的删除会话](docs/images/session-menu-delete.png)
 
 ### 重新生成当前助手回复
 
