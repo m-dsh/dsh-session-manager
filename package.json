@@ -1,7 +1,7 @@
 {
   "name": "dsh-session-manager",
   "version": "0.1.0",
-  "description": "DSH Client 插件：在会话菜单中删除会话，并重新生成指定的助手回复。",
+  "description": "DSH 插件：会话菜单删除会话、重新生成回复、顶栏固定最近用户消息，以及按检查点回滚对话与文件。",
   "license": "MIT",
   "type": "module",
   "main": "./lib/index.js",
@@ -34,7 +34,7 @@
   },
   "dsh": {
     "engines": {
-      "dsh": ">=0.1.1-rc.2"
+      "dsh": ">=0.1.2-rc.1"
     },
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -42,12 +42,22 @@
     "client": {
       "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-runtime"
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-connection"
       ]
     }
   },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "@deepseek-ai/dsh-client-connection": "^0.1.2-rc.1"
+  },
   "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-client-connection": "^0.1.2-rc.1",
     "@deepseek-ai/dsh-client-runtime": "^0.1.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-settings": "^0.1.1-rc.2",
+    "@deepseek-ai/dsh-settings": "^0.1.1-rc.2",
     "@types/node": "^22.0.0",
     "@types/react": "^18.3.0",
     "react": "^18.3.0",
