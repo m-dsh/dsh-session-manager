@@ -4,7 +4,7 @@ import { Context } from "@deepseek-ai/cordis";
 //#region src/index.d.ts
 
 declare const name = "dsh-session-manager";
-declare const inject: readonly ["connection", "webServer"];
+declare const inject: readonly ["connection"];
 /** 设置 schema：默认开启；默认值必须写在 schema 里，不能写成普通对象。 */
 declare const Config: Schema<Schemastery.ObjectS<{
   stickyPromptEnabled: Schema<boolean, boolean>;

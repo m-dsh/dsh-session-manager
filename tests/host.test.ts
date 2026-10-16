@@ -2,10 +2,10 @@ import { describe, expect, it, vi } from 'vitest'
 import { Config, apply, inject, name } from '../src/index'
 
 describe('Host 入口', () => {
-  it('导出稳定名称，并声明 connection + webServer 依赖', () => {
+  it('导出稳定名称，并声明 connection 依赖', () => {
     expect(name).toBe('dsh-session-manager')
-    // connection：注册 checkpoint 回滚 RPC；webServer：dsh-client-connection 0.2.x 安装 RPC 通道所需。
-    expect(inject).toEqual(['connection', 'webServer'])
+    // connection：经 /api exact Fetch 路由提供 checkpoint 回滚接口。
+    expect(inject).toEqual(['connection'])
   })
 
   it('schema 默认开启两个功能开关', () => {

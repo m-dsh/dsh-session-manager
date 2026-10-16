@@ -44,8 +44,7 @@ import {
 
 export const name = 'dsh-session-manager'
 // RPC 路由必须等 connection 服务完成后再安装；否则重启时可能因服务尚未出现而永久跳过注册。
-// webServer 为 dsh-client-connection 0.2.x 安装 RPC 通道的必需依赖。
-export const inject = ['connection', 'webServer'] as const
+export const inject = ['connection'] as const
 
 /** 设置 schema：默认开启；默认值必须写在 schema 里，不能写成普通对象。 */
 export const Config = Schema.object({
