@@ -28,7 +28,6 @@ import {
   chmod,
 } from 'node:fs/promises'
 import Schema from '@deepseek-ai/schemastery'
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import type { Context } from '@deepseek-ai/cordis'
 import {
   CHECKPOINT_CHANNEL,
@@ -45,11 +44,8 @@ import {
 
 export const name = 'dsh-session-manager'
 // RPC 路由必须等 connection 服务完成后再安装；否则重启时可能因服务尚未出现而永久跳过注册。
-// settings 供 Client 的设置面板读写开关，缺失时只影响开关，不影响回滚。
-export const inject = ['connection', 'settings'] as const
-
-/** 设置命名空间：Client 用 webUiSettings.bind({ namespace: 'session-manager' }) 读写。 */
-const SESSION_MANAGER_NS = settingsNamespace('session-manager')
+// webServer 为 dsh-client-connection 0.2.x 安装 RPC 通道的必需依赖。
+export const inject = ['connection', 'webServer'] as const
 
 /** 设置 schema：默认开启；默认值必须写在 schema 里，不能写成普通对象。 */
 export const Config = Schema.object({
@@ -86,11 +82,6 @@ interface HostConnectionHandle {
       opts?: { authority?: string },
     ): void
   }
-}
-
-/** Host settings 服务：注册设置命名空间，Web 设置面板据此读写开关。 */
-interface HostSettings {
-  register(namespace: unknown, schema: unknown, opts?: { applies?: string }): void
 }
 
 interface HostContext extends Context {
@@ -374,12 +365,8 @@ async function sessionLineage(sessions: DshSessions | undefined, sessionId: stri
 // ═══════════════════════════════════════════════════════════
 
 export function apply(ctx: HostContext): void {
-  const hostSettings = (ctx as unknown as { settings?: HostSettings }).settings
-  try {
-    hostSettings?.register(SESSION_MANAGER_NS, Config, { applies: 'live' })
-  } catch (err) {
-    console.warn(`[dsh-session-manager] 注册设置命名空间失败：${toErrorMessage(err)}`)
-  }
+  // 0.2.0-rc.2 起 settings 表单由 SettingsForms 从本包导出的 Config 自动收集，
+  // 不再手动注册；客户端经 webUiSettings.bind({ namespace: 'dsh-session-manager' }) 读写。
 
   const connection = ctx.get('connection')
   const sessions = ctx.get('sessions')

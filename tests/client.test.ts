@@ -58,14 +58,14 @@ describe('Client 插件入口', () => {
     expect(() => apply(ctx as never)).not.toThrow()
   })
 
-  it('注册“会话管理”设置分区，绑定 session-manager 命名空间', () => {
+  it('注册“会话管理”设置分区，绑定 dsh-session-manager 命名空间', () => {
     const { ctx, sections } = createHarness()
 
     apply(ctx as never)
 
     const section = sections.find((item) => item.name === 'settings.section')
     expect(section).toBeDefined()
-    expect(section?.id).toBe('session-manager')
+    expect(section?.id).toBe('dsh-session-manager')
     expect(section?.label).toBe('会话管理')
   })
 

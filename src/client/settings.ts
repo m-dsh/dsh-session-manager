@@ -1,14 +1,14 @@
 /**
  * 设置卡与门控读取（Session 管理）。
  *
- * Host 端在 src/index.ts 注册 settingsNamespace('session-manager')；
+ * Host 端导出 Config 由 SettingsForms 自动收集（entry id = dsh-session-manager）；
  * 这里通过 ctx.webUiSettings.bind 读写同命名空间，并把开关实时映射到
  * 各功能（顶栏固定最近用户消息 / 会话菜单删除会话）的安装与卸载。
  */
 
 import React, { useEffect, useState } from 'react'
 
-export const SETTINGS_NAMESPACE = 'session-manager'
+export const SETTINGS_NAMESPACE = 'dsh-session-manager'
 
 export interface SessionManagerSettings {
   stickyPromptEnabled?: boolean
@@ -152,7 +152,7 @@ export function SessionManagerSection(props: Record<string, unknown>): React.Rea
     snapshot.status === 'loading'
       ? '正在读取设置…'
       : snapshot.status === 'unavailable'
-        ? '设置暂时不可用：Host 端未注册 session-manager 命名空间。'
+        ? '设置暂时不可用：Host 端未注册 dsh-session-manager 命名空间。'
         : snapshot.writable === false
           ? '当前设置只读（由上层配置下发）。'
           : '修改立即生效，无需重启。'
