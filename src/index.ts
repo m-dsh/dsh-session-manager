@@ -30,7 +30,7 @@ import {
 import Schema from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
 import {
-  CHECKPOINT_CHANNEL,
+  CHECKPOINT_API_PATH,
   parseApplyRollbackRequest,
   parseListCheckpointsRequest,
   parsePreviewRollbackRequest,
@@ -75,12 +75,13 @@ interface DshShell {
 }
 
 interface HostConnectionHandle {
-  rpc: {
-    handle(
-      channel: string,
-      handler: (endpoint: string, payload: unknown) => Promise<{ ok: boolean; value?: unknown; error?: unknown }>,
-      opts?: { authority?: string },
-    ): void
+  fetch: {
+    register(route: {
+      path: string
+      methods: string[]
+      requestBody: string
+      fetch: (request: Request) => Promise<Response>
+    }): void
   }
 }
 
@@ -395,9 +396,23 @@ export function apply(ctx: HostContext): void {
   // connection 服务不可用时静默跳过，不阻塞 DSH 启动
   if (!connection) return
 
-  connection.rpc.handle(
-    CHECKPOINT_CHANNEL,
-    async (endpoint, payload) => {
+  connection.fetch.register({
+    path: CHECKPOINT_API_PATH,
+    methods: ['POST'],
+    requestBody: 'buffered',
+    fetch: async (request) => {
+      // 原 RPC 的 endpoint/payload 改由 POST body 携带；/api 通道自带 Host/Origin 围栏与浏览器认证。
+      let endpoint: unknown
+      let payload: unknown
+      try {
+        const body = JSON.parse(await request.text()) as { endpoint?: unknown; payload?: unknown }
+        endpoint = body.endpoint
+        payload = body.payload
+      } catch {
+        return new Response('bad request', { status: 400 })
+      }
+      if (typeof endpoint !== 'string') return new Response('bad request', { status: 400 })
+      const handler = async (endpoint: string, payload: unknown): Promise<{ ok: boolean; value?: unknown; error?: unknown }> => {
       // ── list-checkpoints ──
       if (endpoint === 'list-checkpoints') {
         const req = parseListCheckpointsRequest(payload)
@@ -460,9 +475,10 @@ export function apply(ctx: HostContext): void {
       }
 
       return failure(`未知操作：${String(endpoint)}`)
+      }
+      return Response.json(await handler(endpoint, payload))
     },
-    { authority: 'trusted-host' },
-  )
+  })
 
   // 每个回合结束时自动截取工作区文件快照。
   const listen = (ctx as { on?: (name: string, listener: (...args: unknown[]) => void) => void }).on

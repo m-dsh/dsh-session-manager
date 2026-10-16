@@ -109,15 +109,6 @@ interface DshUiConversation {
  * 只声明用到的成员，避免依赖 @deepseek-ai/dsh-client-connection 的包内类型路径；
  * 该平台模块由宿主 ModuleLoader 注入（见 package.json dsh.client.inject）。
  */
-interface ConnectionHandle {
-    rpc: {
-        call(channel: string, endpoint: string, payload: unknown): Promise<{
-            ok: boolean;
-            value?: unknown;
-            error?: unknown;
-        }>;
-    };
-}
 interface ClientContext {
     slots: DshSlotReg;
     workspaces: DshWorkspaces;
@@ -127,7 +118,6 @@ interface ClientContext {
             namespace: string;
         }): SettingsScope<T>;
     };
-    get(name: 'connection'): ConnectionHandle | undefined;
     get(name: 'uiConversation'): DshUiConversation | undefined;
     on?: (name: 'dispose', callback: () => void) => void;
 }

@@ -1,5 +1,5 @@
 import React from 'react'
-import { CHECKPOINT_CHANNEL } from '../core'
+import { CHECKPOINT_API_PATH } from '../core'
 import { applyStickyPrompt } from './stickyPrompt'
 import {
   SETTINGS_NAMESPACE,
@@ -124,12 +124,6 @@ interface DshUiConversation {
  * 只声明用到的成员，避免依赖 @deepseek-ai/dsh-client-connection 的包内类型路径；
  * 该平台模块由宿主 ModuleLoader 注入（见 package.json dsh.client.inject）。
  */
-interface ConnectionHandle {
-  rpc: {
-    call(channel: string, endpoint: string, payload: unknown): Promise<{ ok: boolean; value?: unknown; error?: unknown }>
-  }
-}
-
 interface ClientContext {
   slots: DshSlotReg
   workspaces: DshWorkspaces
@@ -137,7 +131,6 @@ interface ClientContext {
   webUiSettings: {
     bind<T>(spec: { namespace: string }): SettingsScope<T>
   }
-  get(name: 'connection'): ConnectionHandle | undefined
   get(name: 'uiConversation'): DshUiConversation | undefined
   on?: (name: 'dispose', callback: () => void) => void
 }
@@ -156,14 +149,6 @@ export function apply(ctx: ClientContext): void {
       return undefined
     }
   }
-  const getConnection: Resolver<ConnectionHandle> = () => {
-    try {
-      return ctx.get('connection')
-    } catch {
-      return undefined
-    }
-  }
-
   // ── 设置开关：sticky prompt 与"删除会话"受设置面板控制，切换时实时安装/卸载 ──
   const scope = ctx.webUiSettings.bind<SessionManagerSettings>({ namespace: SETTINGS_NAMESPACE })
   const disposeSettingsCss = injectSettingsCss()
@@ -241,7 +226,7 @@ export function apply(ctx: ClientContext): void {
   })
 
   // ── Checkpoint 回滚入口（常驻在每条用户消息 actions 行，DOM 注入）──
-  const disposeCheckpoints = installCheckpointEntries(sessions, workspaces, getUiConversation, getConnection)
+  const disposeCheckpoints = installCheckpointEntries(sessions, workspaces, getUiConversation)
   ctx.on?.('dispose', disposeCheckpoints)
 
   ctx.on?.('dispose', () => {
@@ -637,15 +622,17 @@ interface RollbackUi {
   done(summary: string, isError: boolean, items?: string[]): void
 }
 
-/** 调一次 checkpoint RPC，失败时抛出带宿主错误信息的 Error。 */
-async function callCheckpoint<T>(
-  connection: ConnectionHandle,
-  endpoint: string,
-  payload: unknown,
-): Promise<T> {
-  const result = await connection.rpc.call(CHECKPOINT_CHANNEL, endpoint, payload)
+/** 调一次 checkpoint 接口（/api exact Fetch 路由），失败时抛出带宿主错误信息的 Error。 */
+async function callCheckpoint<T>(endpoint: string, payload: unknown): Promise<T> {
+  const response = await fetch(CHECKPOINT_API_PATH, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ endpoint, payload }),
+  })
+  if (!response.ok) throw new Error(`${endpoint} 失败（HTTP ${response.status}）`)
+  const result = (await response.json()) as { ok: boolean; value?: unknown; error?: { message?: string } }
   if (!result.ok) {
-    throw new Error(((result.error as { message?: string } | undefined)?.message) ?? `${endpoint} 失败`)
+    throw new Error(result.error?.message ?? `${endpoint} 失败`)
   }
   return result.value as T
 }
@@ -654,7 +641,6 @@ function openRollbackDialog(
   cp: UserCheckpoint,
   sessions: DshSessions,
   workspaces: DshWorkspaces,
-  getConnection: Resolver<ConnectionHandle>,
 ): void {
   document.querySelector(CHECKPOINT_DIALOG)?.remove()
 
@@ -877,7 +863,7 @@ function openRollbackDialog(
     refreshHint()
     hintRefreshers.push(refreshHint)
     action.addEventListener('click', () => {
-      void performRollback(cp, withFiles, sessions, workspaces, getConnection, ui, () => plan)
+      void performRollback(cp, withFiles, sessions, workspaces, ui, () => plan)
     })
     return action
   }
@@ -898,13 +884,7 @@ function openRollbackDialog(
   document.body.appendChild(overlay)
 
   // 预演请求（只读）：失败就退回静态提示，不影响回滚本身。
-  const connection = getConnection()
-  if (!connection) {
-    planState = 'error'
-    for (const refresh of hintRefreshers) refresh()
-    return
-  }
-  void callCheckpoint<RollbackPreview>(connection, 'preview-rollback', {
+  void callCheckpoint<RollbackPreview>('preview-rollback', {
     sessionId: sessions.list.getSnapshot().current,
     checkpointSeq: cp.forkSeq,
   })
@@ -929,7 +909,6 @@ async function performRollback(
   withFiles: boolean,
   sessions: DshSessions,
   workspaces: DshWorkspaces,
-  getConnection: Resolver<ConnectionHandle>,
   ui: RollbackUi,
   getPlan: () => RollbackPreview | undefined,
 ): Promise<void> {
@@ -944,11 +923,6 @@ async function performRollback(
       ui.fail('无法确定当前会话')
       return
     }
-    const connection = getConnection()
-    if (!connection) {
-      ui.fail('连接服务不可用')
-      return
-    }
 
     ui.begin()
 
@@ -956,7 +930,7 @@ async function performRollback(
     let preview = getPlan()
     if (withFiles && !preview) {
       ui.progress(6, '正在读取检查点快照…')
-      preview = await callCheckpoint<RollbackPreview>(connection, 'preview-rollback', {
+      preview = await callCheckpoint<RollbackPreview>('preview-rollback', {
         sessionId,
         checkpointSeq: cp.forkSeq,
       })
@@ -984,7 +958,6 @@ async function performRollback(
       ui.progress(30, `正在校验并按计划回滚 ${workCount} 个文件…`)
       ui.detail([])
       applyResult = await callCheckpoint<{ restored: string[]; removed: string[]; conflicts: string[]; errors: string[] }>(
-        connection,
         'apply-rollback',
         { planId: plan.planId },
       )
@@ -1002,7 +975,7 @@ async function performRollback(
 
     // ── 3) 文件 OK，再回滚对话：fork 到检查点之前 ──
     ui.progress(78, `正在清除第 ${cp.turn} 轮及之后的对话…`)
-    const convData = await callCheckpoint<{ newSessionId: string }>(connection, 'rollback-conversation', {
+    const convData = await callCheckpoint<{ newSessionId: string }>('rollback-conversation', {
       sessionId,
       checkpointSeq: cp.forkSeq,
     })
@@ -1052,7 +1025,6 @@ function installCheckpointEntries(
   sessions: DshSessions,
   workspaces: DshWorkspaces,
   getUiConversation: Resolver<DshUiConversation>,
-  getConnection: Resolver<ConnectionHandle>,
 ): () => void {
   if (typeof document === 'undefined') return () => undefined
 
@@ -1146,14 +1118,14 @@ function installCheckpointEntries(
           continue
         }
         if (!pill) {
-          pill = createCheckpointPill(cp, key, () => openRollbackDialog(cp, sessions, workspaces, getConnection))
+          pill = createCheckpointPill(cp, key, () => openRollbackDialog(cp, sessions, workspaces))
           pillByKey.set(key, pill)
         }
         const actions = findActionsRow(row)
         if (actions) {
           // 复制按钮的 actions 行作为唯一宿主；复制其真实 class/style，确保两者视觉一致。
           if (!actions.contains(pill)) actions.appendChild(pill)
-          adoptCopyButtonStyle(pill, actions, cp, () => openRollbackDialog(cp, sessions, workspaces, getConnection))
+          adoptCopyButtonStyle(pill, actions, cp, () => openRollbackDialog(cp, sessions, workspaces))
           rowsWithActions += 1
           if (actions.querySelector('button[aria-label="复制"], button[aria-label="copy"]')) copyTemplates += 1
         } else if (row.nextElementSibling !== pill) {

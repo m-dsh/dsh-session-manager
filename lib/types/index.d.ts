@@ -57,13 +57,12 @@ interface DshShell {
     }>;
 }
 interface HostConnectionHandle {
-    rpc: {
-        handle(channel: string, handler: (endpoint: string, payload: unknown) => Promise<{
-            ok: boolean;
-            value?: unknown;
-            error?: unknown;
-        }>, opts?: {
-            authority?: string;
+    fetch: {
+        register(route: {
+            path: string;
+            methods: string[];
+            requestBody: string;
+            fetch: (request: Request) => Promise<Response>;
         }): void;
     };
 }
