@@ -48,7 +48,7 @@ export const name = 'dsh-session-manager'
 // settings 供 Client 的设置面板读写开关，缺失时只影响开关，不影响回滚。
 export const inject = ['connection', 'settings'] as const
 
-/** 设置命名空间：Client 用 settingsScope.bind({ namespace: 'session-manager' }) 读写。 */
+/** 设置命名空间：Client 用 webUiSettings.bind({ namespace: 'session-manager' }) 读写。 */
 const SESSION_MANAGER_NS = settingsNamespace('session-manager')
 
 /** 设置 schema：默认开启；默认值必须写在 schema 里，不能写成普通对象。 */

@@ -2,7 +2,7 @@
  * 设置卡与门控读取（Session 管理）。
  *
  * Host 端在 src/index.ts 注册 settingsNamespace('session-manager')；
- * 这里通过 ctx.settingsScope.bind 读写同命名空间，并把开关实时映射到
+ * 这里通过 ctx.webUiSettings.bind 读写同命名空间，并把开关实时映射到
  * 各功能（顶栏固定最近用户消息 / 会话菜单删除会话）的安装与卸载。
  */
 

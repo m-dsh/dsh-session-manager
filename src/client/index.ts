@@ -11,7 +11,7 @@ import {
 } from './settings'
 
 export const name = 'dsh-session-manager-client'
-export const inject = ['slots', 'workspaces', 'sessions', 'settingsScope'] as const
+export const inject = ['slots', 'workspaces', 'sessions', 'webUiSettings'] as const
 
 interface ObservableSnapshot<T> {
   getSnapshot(): T
@@ -134,7 +134,7 @@ interface ClientContext {
   slots: DshSlotReg
   workspaces: DshWorkspaces
   sessions: DshSessions
-  settingsScope: {
+  webUiSettings: {
     bind<T>(spec: { namespace: string }): SettingsScope<T>
   }
   get(name: 'connection'): ConnectionHandle | undefined
@@ -165,7 +165,7 @@ export function apply(ctx: ClientContext): void {
   }
 
   // ── 设置开关：sticky prompt 与"删除会话"受设置面板控制，切换时实时安装/卸载 ──
-  const scope = ctx.settingsScope.bind<SessionManagerSettings>({ namespace: SETTINGS_NAMESPACE })
+  const scope = ctx.webUiSettings.bind<SessionManagerSettings>({ namespace: SETTINGS_NAMESPACE })
   const disposeSettingsCss = injectSettingsCss()
 
   let disposeSticky: (() => void) | undefined

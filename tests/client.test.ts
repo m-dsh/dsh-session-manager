@@ -39,7 +39,7 @@ function createHarness(initial: Record<string, boolean> = {}) {
   }
 
   return {
-    ctx: { slots, workspaces, sessions, settingsScope: { bind: () => scope } },
+    ctx: { slots, workspaces, sessions, webUiSettings: { bind: () => scope } },
     sections,
     setCalls,
     setValues: (next: Record<string, boolean>) => {
@@ -52,7 +52,7 @@ function createHarness(initial: Record<string, boolean> = {}) {
 describe('Client 插件入口', () => {
   it('导出稳定名称和可调用入口', () => {
     expect(name).toBe('dsh-session-manager-client')
-    expect(inject).toEqual(['slots', 'workspaces', 'sessions', 'settingsScope'])
+    expect(inject).toEqual(['slots', 'workspaces', 'sessions', 'webUiSettings'])
 
     const { ctx } = createHarness()
     expect(() => apply(ctx as never)).not.toThrow()
@@ -73,7 +73,7 @@ describe('Client 插件入口', () => {
     const { ctx, setCalls } = createHarness({ stickyPromptEnabled: true, sessionDeleteEnabled: true })
 
     apply(ctx as never)
-    const scope = ctx.settingsScope.bind() as unknown as {
+    const scope = ctx.webUiSettings.bind() as unknown as {
       set: (field: string, value: unknown) => Promise<void>
     }
     await scope.set('stickyPromptEnabled', false)
