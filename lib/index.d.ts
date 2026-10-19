@@ -6,13 +6,13 @@ import { Context } from "@deepseek-ai/cordis";
 declare const name = "dsh-session-manager";
 declare const inject: readonly ["connection"];
 /** 设置 schema：默认开启；默认值必须写在 schema 里，不能写成普通对象。 */
-declare const Config: Schema<Schemastery.ObjectS<{
-  stickyPromptEnabled: Schema<boolean, boolean>;
-  sessionDeleteEnabled: Schema<boolean, boolean>;
-}>, Schemastery.ObjectT<{
-  stickyPromptEnabled: Schema<boolean, boolean>;
-  sessionDeleteEnabled: Schema<boolean, boolean>;
-}>>;
+declare const Config: Schema<Schemastery.ObjectS<NoInfer<{
+  stickyPromptEnabled: Schema<boolean, boolean, "volatile-defined">;
+  sessionDeleteEnabled: Schema<boolean, boolean, "volatile-defined">;
+}>>, Schemastery.ObjectT<NoInfer<{
+  stickyPromptEnabled: Schema<boolean, boolean, "volatile-defined">;
+  sessionDeleteEnabled: Schema<boolean, boolean, "volatile-defined">;
+}>>, "plain">;
 type ConfigType = ReturnType<typeof Config>;
 interface DshSessions {
   get(id: string): {

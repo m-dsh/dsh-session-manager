@@ -1,4 +1,5 @@
 import React from 'react'
+import type { ConfigForms } from '@deepseek-ai/dsh-client-ui-settings/client'
 import { CHECKPOINT_API_PATH } from '../core'
 import { applyStickyPrompt } from './stickyPrompt'
 import {
@@ -7,11 +8,10 @@ import {
   injectSettingsCss,
   readSettings,
   type SessionManagerSettings,
-  type SettingsScope,
 } from './settings'
 
 export const name = 'dsh-session-manager-client'
-export const inject = ['slots', 'workspaces', 'sessions', 'webUiSettings'] as const
+export const inject = ['slots', 'workspaces', 'sessions', 'configForms'] as const
 
 interface ObservableSnapshot<T> {
   getSnapshot(): T
@@ -121,16 +121,13 @@ interface DshUiConversation {
 
 /**
  * Client 侧连接句柄（RPC 调用面）。
- * 只声明用到的成员，避免依赖 @deepseek-ai/dsh-client-connection 的包内类型路径；
- * 该平台模块由宿主 ModuleLoader 注入（见 package.json dsh.client.inject）。
+ * 仅列出本插件使用的业务成员；设置控制器类型使用公开的 ConfigForm 契约。
  */
 interface ClientContext {
   slots: DshSlotReg
   workspaces: DshWorkspaces
   sessions: DshSessions
-  webUiSettings: {
-    bind<T>(spec: { namespace: string }): SettingsScope<T>
-  }
+  configForms: Pick<ConfigForms, 'get'>
   get(name: 'uiConversation'): DshUiConversation | undefined
   on?: (name: 'dispose', callback: () => void) => void
 }
@@ -150,7 +147,7 @@ export function apply(ctx: ClientContext): void {
     }
   }
   // ── 设置开关：sticky prompt 与"删除会话"受设置面板控制，切换时实时安装/卸载 ──
-  const scope = ctx.webUiSettings.bind<SessionManagerSettings>({ namespace: SETTINGS_NAMESPACE })
+  const scope = ctx.configForms.get<SessionManagerSettings>(SETTINGS_NAMESPACE)
   const disposeSettingsCss = injectSettingsCss()
 
   let disposeSticky: (() => void) | undefined

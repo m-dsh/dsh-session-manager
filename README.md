@@ -1,6 +1,6 @@
 # dsh-session-manager
 
-一个 Client-only DSH 插件，为 DSH Web 的会话记录和会话详情补充以下能力：
+一个包含 Host 和 Web Client 的 DSH 插件，为 DSH Web 的会话记录和会话详情补充以下能力：
 
 - 在会话记录菜单的“归档会话”下方添加“删除会话”；
 - 在助手消息操作区添加“重新生成”，重新生成当前助手回复，而不是继续发送新的提示词；
@@ -16,7 +16,9 @@
 | 提示词悬浮 | 顶栏固定最近一条用户消息；关闭后立即移除提示条 |
 | 删除会话 | 会话记录下拉菜单中的“删除会话”；关闭后立即还原菜单 |
 
-设置命名空间为 `session-manager`，由 Host 入口通过 `ctx.settings.register()` 注册，Client 用 `ctx.settingsScope.bind()` 读写；改动实时生效，不需要重启。
+设置命名空间为 profile entry id `dsh-session-manager`。Host 的两个 Config 字段标记为 volatile，由 SettingsForms 自动投影；Client 通过 `ctx.configForms.get('dsh-session-manager')` 读写，功能随设置快照实时安装或卸载，不需要重启。
+
+若提示设置不可用，确认 DSH 版本至少为 `0.2.0-rc.2`，profile bundles 包含插件。本地 `link:` 安装在源码修改后需要重新 `pnpm build`，重启对应 DSH profile 并刷新浏览器，以同步 Host 和 Client 产物。连接采用 memory 模式时无法保存 Host 设置，请在 DSH 所在电脑通过 localhost 访问。
 
 ## 功能效果
 
@@ -55,15 +57,10 @@ dsh plugin --profile web add link:/path/to/dsh-session-manager
 然后重启 DSH Web：
 
 ```bash
-dsh web
+dsh --profile web
 ```
 
-如果之前安装过旧版本，建议先移除再重新安装：
-
-```bash
-dsh plugin --profile web remove dsh-session-manager
-dsh plugin --profile web add link:/path/to/dsh-session-manager
-```
+已有 `link:` 指向同一插件目录时，重新构建并重启即可，无需反复移除和安装。
 
 ### 3. 开始使用
 
@@ -73,8 +70,8 @@ dsh plugin --profile web add link:/path/to/dsh-session-manager
 
 ## 兼容性
 
-- DSH：`>=0.1.1-rc.2`
-- Web Client：需要提供 `slots`、`workspaces` 和 `sessions` 注入能力。
+- DSH：`>=0.2.0-rc.2`
+- Web Client：需要提供 `slots`、`workspaces`、`sessions` 和 `configForms` 注入能力。
 
 ## 实现说明
 
@@ -82,7 +79,7 @@ dsh plugin --profile web add link:/path/to/dsh-session-manager
 
 重新生成操作以当前助手消息为作用域，不能通过发送新的用户消息来模拟重试；实现时需要处理原消息替换、生成中状态、取消、异常和卸载清理。
 
-插件包通过 `package.json` 的 `exports["./client"]` 和 `dsh.client` 配置加载 Client bundle；Host 入口仅用于保留标准插件加载契约，不注册 Tool 或其他 Host 状态。
+插件包通过 `package.json` 的 `exports["./client"]` 和 `dsh.client` 配置加载 Client bundle；Host 入口提供 Config 设置表单和 checkpoint 回滚接口。
 
 ## 开发
 

@@ -48,8 +48,8 @@ export const inject = ['connection'] as const
 
 /** 设置 schema：默认开启；默认值必须写在 schema 里，不能写成普通对象。 */
 export const Config = Schema.object({
-  stickyPromptEnabled: Schema.boolean().default(true),
-  sessionDeleteEnabled: Schema.boolean().default(true),
+  stickyPromptEnabled: Schema.boolean().default(true).volatile(),
+  sessionDeleteEnabled: Schema.boolean().default(true).volatile(),
 })
 
 export type ConfigType = ReturnType<typeof Config>
@@ -365,8 +365,8 @@ async function sessionLineage(sessions: DshSessions | undefined, sessionId: stri
 // ═══════════════════════════════════════════════════════════
 
 export function apply(ctx: HostContext): void {
-  // 0.2.0-rc.2 起 settings 表单由 SettingsForms 从本包导出的 Config 自动收集，
-  // 不再手动注册；客户端经 webUiSettings.bind({ namespace: 'dsh-session-manager' }) 读写。
+  // SettingsForms 自动收集 Config 的 volatile 字段；
+  // 客户端经 configForms.get('dsh-session-manager') 读写并更新功能门控。
 
   const connection = ctx.get('connection')
   const sessions = ctx.get('sessions')

@@ -1,7 +1,7 @@
 import React from 'react';
-import { type SettingsScope } from './settings';
+import type { ConfigForms } from '@deepseek-ai/dsh-client-ui-settings/client';
 export declare const name = "dsh-session-manager-client";
-export declare const inject: readonly ["slots", "workspaces", "sessions", "webUiSettings"];
+export declare const inject: readonly ["slots", "workspaces", "sessions", "configForms"];
 interface ObservableSnapshot<T> {
     getSnapshot(): T;
     subscribe?(listener: () => void): () => void;
@@ -106,18 +106,13 @@ interface DshUiConversation {
 }
 /**
  * Client 侧连接句柄（RPC 调用面）。
- * 只声明用到的成员，避免依赖 @deepseek-ai/dsh-client-connection 的包内类型路径；
- * 该平台模块由宿主 ModuleLoader 注入（见 package.json dsh.client.inject）。
+ * 仅列出本插件使用的业务成员；设置控制器类型使用公开的 ConfigForm 契约。
  */
 interface ClientContext {
     slots: DshSlotReg;
     workspaces: DshWorkspaces;
     sessions: DshSessions;
-    webUiSettings: {
-        bind<T>(spec: {
-            namespace: string;
-        }): SettingsScope<T>;
-    };
+    configForms: Pick<ConfigForms, 'get'>;
     get(name: 'uiConversation'): DshUiConversation | undefined;
     on?: (name: 'dispose', callback: () => void) => void;
 }
