@@ -44,11 +44,12 @@ function injectCss(): () => void {
     '.dsmgr_rowText{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}',
     '.dsmgr_rowTitle{font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary)}',
     '.dsmgr_rowDesc{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}',
-    '.dsmgr_card .dsmgr_toggle{appearance:none;background:var(--dsw-alias-bg-layer-3);box-shadow:inset 0 0 0 1px var(--dsw-alias-border-l3);cursor:pointer;transition:background .12s}',
-    '.dsmgr_card .dsmgr_toggle[aria-checked=true]{background:var(--dsw-alias-brand-primary);box-shadow:none}',
-    '.dsmgr_card .dsmgr_toggle:disabled{opacity:.4;cursor:default}',
-    '.dsmgr_card .dsmgr_toggle:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}',
-    '.dsmgr_card .dsmgr_knob{background:var(--dsw-alias-label-primary-foreground,#fff);box-shadow:0 0 0 1px var(--dsw-alias-border-l4,#0f172a1f);transition:transform .12s}',
+    '.dsmgr_card .dsmgr_toggle{appearance:none;position:relative;corner-shape:round;background:var(--dsw-alias-border-l3);cursor:pointer}',
+    '.dsmgr_card .dsmgr_toggle[aria-checked=true]{background:var(--dsw-alias-brand-primary)}',
+    '.dsmgr_card .dsmgr_toggle:disabled{opacity:.5;cursor:default}',
+    '.dsmgr_card .dsmgr_toggle:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}',
+    '.dsmgr_card .dsmgr_knob{corner-shape:round;background:var(--dsw-alias-label-primary-foreground);transition:transform 120ms ease}',
+    '.dsmgr_card .dsmgr_toggle[aria-checked=false] .dsmgr_knob{background:var(--dsw-alias-switch-thumb)}',
     '.dsmgr_note{margin-top:8px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}',
   ].join('')
   if (previous === null) document.head.appendChild(tag)
@@ -74,7 +75,7 @@ function ToggleSwitch(props: {
       className: 'dsmgr_toggle',
       style: {
         boxSizing: 'border-box', display: 'inline-flex', alignItems: 'center',
-        justifyContent: 'flex-start', flex: '0 0 40px', width: 40, height: 22,
+        justifyContent: 'flex-start', flex: '0 0 auto', width: 36, height: 20,
         padding: 2, margin: 0, border: 0, borderRadius: 999,
       },
       onClick: props.onChange,
@@ -83,8 +84,8 @@ function ToggleSwitch(props: {
       className: 'dsmgr_knob',
       style: {
         boxSizing: 'border-box', display: 'block', flexShrink: 0,
-        width: 18, height: 18, margin: 0, padding: 0, border: 0, borderRadius: '50%',
-        transform: `translateX(${props.checked ? 18 : 0}px)`,
+        width: 16, height: 16, margin: 0, padding: 0, border: 0, borderRadius: '50%',
+        transform: `translateX(${props.checked ? 16 : 0}px)`,
       },
     }),
   )

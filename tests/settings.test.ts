@@ -67,11 +67,11 @@ describe('会话管理设置卡', () => {
     expect(button.props).toMatchObject({
       type: 'button', role: 'switch', 'aria-checked': checked,
       'aria-label': '提示词悬浮', disabled: true,
-      style: { borderRadius: 999, alignItems: 'center', width: 40, height: 22, padding: 2, border: 0 },
+      style: { borderRadius: 999, alignItems: 'center', width: 36, height: 20, padding: 2, border: 0 },
     })
     expect(button.props.children.props).toMatchObject({
       className: 'dsmgr_knob',
-      style: { borderRadius: '50%', width: 18, height: 18, flexShrink: 0, transform: `translateX(${checked ? 18 : 0}px)` },
+      style: { borderRadius: '50%', width: 16, height: 16, flexShrink: 0, transform: `translateX(${checked ? 16 : 0}px)` },
     })
   })
 
