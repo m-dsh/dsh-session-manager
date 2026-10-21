@@ -28,10 +28,9 @@ import {
   chmod,
 } from 'node:fs/promises'
 import Schema from '@deepseek-ai/schemastery'
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import type { Context } from '@deepseek-ai/cordis'
 import {
-  CHECKPOINT_CHANNEL,
+  CHECKPOINT_API_PATH,
   parseApplyRollbackRequest,
   parseListCheckpointsRequest,
   parsePreviewRollbackRequest,
@@ -45,16 +44,12 @@ import {
 
 export const name = 'dsh-session-manager'
 // RPC 路由必须等 connection 服务完成后再安装；否则重启时可能因服务尚未出现而永久跳过注册。
-// settings 供 Client 的设置面板读写开关，缺失时只影响开关，不影响回滚。
-export const inject = ['connection', 'settings'] as const
-
-/** 设置命名空间：Client 用 settingsScope.bind({ namespace: 'session-manager' }) 读写。 */
-const SESSION_MANAGER_NS = settingsNamespace('session-manager')
+export const inject = ['connection'] as const
 
 /** 设置 schema：默认开启；默认值必须写在 schema 里，不能写成普通对象。 */
 export const Config = Schema.object({
-  stickyPromptEnabled: Schema.boolean().default(true),
-  sessionDeleteEnabled: Schema.boolean().default(true),
+  stickyPromptEnabled: Schema.boolean().default(true).volatile(),
+  sessionDeleteEnabled: Schema.boolean().default(true).volatile(),
 })
 
 export type ConfigType = ReturnType<typeof Config>
@@ -79,18 +74,14 @@ interface DshShell {
 }
 
 interface HostConnectionHandle {
-  rpc: {
-    handle(
-      channel: string,
-      handler: (endpoint: string, payload: unknown) => Promise<{ ok: boolean; value?: unknown; error?: unknown }>,
-      opts?: { authority?: string },
-    ): void
+  fetch: {
+    register(route: {
+      path: string
+      methods: string[]
+      requestBody: string
+      fetch: (request: Request) => Promise<Response>
+    }): void
   }
-}
-
-/** Host settings 服务：注册设置命名空间，Web 设置面板据此读写开关。 */
-interface HostSettings {
-  register(namespace: unknown, schema: unknown, opts?: { applies?: string }): void
 }
 
 interface HostContext extends Context {
@@ -374,12 +365,8 @@ async function sessionLineage(sessions: DshSessions | undefined, sessionId: stri
 // ═══════════════════════════════════════════════════════════
 
 export function apply(ctx: HostContext): void {
-  const hostSettings = (ctx as unknown as { settings?: HostSettings }).settings
-  try {
-    hostSettings?.register(SESSION_MANAGER_NS, Config, { applies: 'live' })
-  } catch (err) {
-    console.warn(`[dsh-session-manager] 注册设置命名空间失败：${toErrorMessage(err)}`)
-  }
+  // SettingsForms 自动收集 Config 的 volatile 字段；
+  // 客户端经 configForms.get('dsh-session-manager') 读写并更新功能门控。
 
   const connection = ctx.get('connection')
   const sessions = ctx.get('sessions')
@@ -408,9 +395,23 @@ export function apply(ctx: HostContext): void {
   // connection 服务不可用时静默跳过，不阻塞 DSH 启动
   if (!connection) return
 
-  connection.rpc.handle(
-    CHECKPOINT_CHANNEL,
-    async (endpoint, payload) => {
+  connection.fetch.register({
+    path: CHECKPOINT_API_PATH,
+    methods: ['POST'],
+    requestBody: 'buffered',
+    fetch: async (request) => {
+      // 原 RPC 的 endpoint/payload 改由 POST body 携带；/api 通道自带 Host/Origin 围栏与浏览器认证。
+      let endpoint: unknown
+      let payload: unknown
+      try {
+        const body = JSON.parse(await request.text()) as { endpoint?: unknown; payload?: unknown }
+        endpoint = body.endpoint
+        payload = body.payload
+      } catch {
+        return new Response('bad request', { status: 400 })
+      }
+      if (typeof endpoint !== 'string') return new Response('bad request', { status: 400 })
+      const handler = async (endpoint: string, payload: unknown): Promise<{ ok: boolean; value?: unknown; error?: unknown }> => {
       // ── list-checkpoints ──
       if (endpoint === 'list-checkpoints') {
         const req = parseListCheckpointsRequest(payload)
@@ -473,9 +474,10 @@ export function apply(ctx: HostContext): void {
       }
 
       return failure(`未知操作：${String(endpoint)}`)
+      }
+      return Response.json(await handler(endpoint, payload))
     },
-    { authority: 'trusted-host' },
-  )
+  })
 
   // 每个回合结束时自动截取工作区文件快照。
   const listen = (ctx as { on?: (name: string, listener: (...args: unknown[]) => void) => void }).on

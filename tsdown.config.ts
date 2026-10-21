@@ -6,7 +6,7 @@ export default defineConfig([
     format: ['esm'],
     outDir: 'lib',
     clean: true,
-    external: ['@deepseek-ai/schemastery', '@deepseek-ai/dsh-settings', '@deepseek-ai/cordis', '@deepseek-ai/dsh-client-connection'],
+    external: ['@deepseek-ai/schemastery', '@deepseek-ai/cordis'],
     // 产物由 DSH 直接加载、不再二次压缩；去掉注释可避免打包器注入的
     // /* @__PURE__ */ 标注被静态校验误判为未替换模板占位符。
     outputOptions: { comments: false },
@@ -16,7 +16,7 @@ export default defineConfig([
     format: ['cjs'],
     outDir: 'lib',
     outExtensions: () => ({ dts: '.d.ts', js: '.js' }),
-    external: ['react', '@deepseek-ai/dsh-client-connection'],
+    external: ['react'],
     outputOptions: {
       comments: false,
       entryFileNames: 'client.js',

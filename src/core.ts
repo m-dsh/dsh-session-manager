@@ -1,7 +1,7 @@
 /** dsh-session-manager checkpoint 跨端协议。只包含可序列化的数据。 */
 
-// RPC channel 只能有一个 path segment；endpoint 再承载具体操作。
-export const CHECKPOINT_CHANNEL = '/dsh-session-manager'
+/** /api 下的 exact Fetch 路由；POST body { endpoint, payload } 承载具体操作。 */
+export const CHECKPOINT_API_PATH = '/api/dsh-session-manager'
 
 /** 单个检查点信息 */
 export interface CheckpointInfo {
