@@ -20,13 +20,17 @@ export function flattenPromptText(text: string): string {
 interface StuckRowBox {
   key: string
   top: number
+  /** 行底边(视口坐标):整条消息完全滚出视口的判定用。 */
+  bottom: number
 }
 
 const PIN = 0.5
 const RELEASE = 8
 
 /**
- * 最近一条已滚过视口顶部的用户行；带滞回（PIN/RELEASE）防止样式抖动。
+ * 最近一条已**完全**滚出视口顶部的用户行；带滞回（PIN/RELEASE）防止
+ * 样式抖动。吸附条件是行底(不是行顶)越过视口顶——长消息主体还在视口
+ * 内可见时不吸附,避免吸附条遮住消息上部导致无法完整阅读。
  * currentKey 为当前 pinned key，用于在边缘区间保持粘滞。
  */
 export function pickPinnedRow(
@@ -34,20 +38,23 @@ export function pickPinnedRow(
   scrollerTop: number,
   currentKey?: string,
 ): string | undefined {
+  // display:none 的隐藏行（如 rewind 后保留的旧行）rect 全为 0，bottom=0 会
+  // 被误判成“已滚出视口”而幽灵吸附，先剔除零高度行再判定。
+  const visible = rows.filter((row) => row.bottom > row.top)
   let lastPast: string | undefined
   let lastPastIndex = -1
-  for (const [index, row] of rows.entries()) {
-    if (row.top <= scrollerTop + PIN) {
+  for (const [index, row] of visible.entries()) {
+    if (row.bottom <= scrollerTop + PIN) {
       lastPast = row.key
       lastPastIndex = index
     }
   }
 
   if (currentKey !== undefined) {
-    const currentIndex = rows.findIndex((row) => row.key === currentKey)
-    const current = currentIndex === -1 ? undefined : rows[currentIndex]
+    const currentIndex = visible.findIndex((row) => row.key === currentKey)
+    const current = currentIndex === -1 ? undefined : visible[currentIndex]
     if (lastPastIndex > currentIndex) return lastPast
-    if (current !== undefined && current.top <= scrollerTop + RELEASE) return currentKey
+    if (current !== undefined && current.bottom <= scrollerTop + RELEASE) return currentKey
   }
 
   return lastPast
@@ -69,7 +76,8 @@ function rowBoxesOf(scroller: HTMLElement): RowBox[] {
     if (key === '') continue
     // 隐藏的流程节点（折叠过程行）不带用户文本，跳过
     if (row.hasAttribute('data-turn-process-hidden')) continue
-    rows.push({ key, top: row.getBoundingClientRect().top, row })
+    const rect = row.getBoundingClientRect()
+    rows.push({ key, top: rect.top, bottom: rect.bottom, row })
   }
   return rows
 }
@@ -267,7 +275,7 @@ function renderBar(
   const rows = rowBoxesOf(scroller)
   const previous = host.dataset.dshStickyKey
   const next = pickPinnedRow(
-    rows.map((row) => ({ key: row.key, top: row.top })),
+    rows.map((row) => ({ key: row.key, top: row.top, bottom: row.bottom })),
     scroller.getBoundingClientRect().top,
     previous,
   )
