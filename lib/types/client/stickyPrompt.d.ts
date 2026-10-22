@@ -14,9 +14,13 @@ export declare function flattenPromptText(text: string): string;
 interface StuckRowBox {
     key: string;
     top: number;
+    /** 行底边(视口坐标):整条消息完全滚出视口的判定用。 */
+    bottom: number;
 }
 /**
- * 最近一条已滚过视口顶部的用户行；带滞回（PIN/RELEASE）防止样式抖动。
+ * 最近一条已**完全**滚出视口顶部的用户行；带滞回（PIN/RELEASE）防止
+ * 样式抖动。吸附条件是行底(不是行顶)越过视口顶——长消息主体还在视口
+ * 内可见时不吸附,避免吸附条遮住消息上部导致无法完整阅读。
  * currentKey 为当前 pinned key，用于在边缘区间保持粘滞。
  */
 export declare function pickPinnedRow(rows: readonly StuckRowBox[], scrollerTop: number, currentKey?: string): string | undefined;

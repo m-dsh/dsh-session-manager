@@ -17,7 +17,7 @@ vi.mock('react', async (original) => {
 function createForm(overrides: Partial<ConfigFormSnapshot<SessionManagerSettings>> = {}) {
   const snapshot: ConfigFormSnapshot<SessionManagerSettings> = {
     status: 'ready', value: { stickyPromptEnabled: true, sessionDeleteEnabled: false },
-    writable: true, mode: 'host', revision: 0, base: {}, user: {}, ...overrides,
+    writable: true, revision: 0, base: {}, user: {}, ...overrides,
   }
   const form: ConfigForm<SessionManagerSettings> = {
     getSnapshot: () => snapshot,
@@ -76,11 +76,10 @@ describe('会话管理设置卡', () => {
   })
 
   it.each([
-    { status: 'loading' as const, mode: 'host' as const, text: '正在读取设置' },
-    { status: 'unavailable' as const, mode: 'host' as const, text: 'Host 已加载兼容' },
-    { status: 'unavailable' as const, mode: 'memory' as const, text: 'localhost' },
-  ])('禁用 $status / $mode 状态并显示对应提示', ({ status, mode, text }) => {
-    const { form } = createForm({ status, mode, writable: false, value: undefined })
+    { status: 'loading' as const, text: '正在读取设置' },
+    { status: 'unavailable' as const, text: 'Host 已加载兼容' },
+  ])('禁用 $status 状态并显示对应提示', ({ status, text }) => {
+    const { form } = createForm({ status, writable: false, value: undefined })
     const { rows, note } = render(form)
     expect(rows.every((row) => row.props.disabled)).toBe(true)
     expect(note).toContain(text)
