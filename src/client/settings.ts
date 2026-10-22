@@ -159,9 +159,7 @@ export function SessionManagerSection(props: Record<string, unknown>): React.Rea
     snapshot.status === 'loading'
       ? '正在读取设置…'
       : snapshot.status === 'unavailable'
-        ? snapshot.mode === 'memory'
-          ? '当前连接不支持保存设置，请在 DSH 所在电脑通过 localhost 打开设置。'
-          : '设置暂时不可用，请确认 Host 已加载兼容的 dsh-session-manager 插件，并刷新页面。'
+        ? '设置暂时不可用，请确认 Host 已加载兼容的 dsh-session-manager 插件，并刷新页面。'
         : snapshot.writable === false
           ? '当前设置只读（由上层配置下发）。'
           : '修改立即生效，无需重启。'

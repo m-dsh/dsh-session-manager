@@ -11,10 +11,13 @@ interface SessionSummary {
     title?: string;
     displayTitle?: string;
     cwd?: string;
+    /** 0.2.x：本地引用计数（mainView>0 即主视图正在展示的会话）。 */
+    retainedBy?: Record<string, number>;
 }
 interface SessionListState {
     ids: string[];
     byId: Record<string, SessionSummary>;
+    /** 老版本字段；0.2.1 起移除，改用 byId[id].retainedBy.mainView。 */
     current?: string;
 }
 interface WorkspaceListState {
@@ -31,8 +34,20 @@ interface DshWorkspaces {
 }
 /** 0.1.2：Session.getSnapshot() 只有 queue/running 等控制字段，没有消息节点；
  *  消息上下文必须读 uiConversation 的 chat 视图（其 legacy 切片含 flat nodes + turnEnds）。 */
+interface RemoteCommandResult {
+    ok: boolean;
+    value?: {
+        matched?: boolean;
+    };
+    error?: {
+        code?: string;
+        message?: string;
+    };
+}
 interface SessionFace {
     prompt(parts: unknown[], mode: 'queue' | 'steer', signal?: AbortSignal): Promise<unknown>;
+    /** 执行一条斜杠命令（纯接纳语义；结局以 chat 视图的 CommandNode 落定）。 */
+    command(line: string): Promise<RemoteCommandResult>;
 }
 interface DshSessions {
     readonly list: ObservableSnapshot<SessionListState>;
@@ -45,6 +60,8 @@ interface DshSessions {
         increaseTitle?: boolean;
     }): Promise<string>;
     open(id: string): void;
+    /** 会话输入 shell 的作用域键（composer draft 写入需要）。 */
+    scope?(id: string): unknown;
 }
 interface ConversationNode {
     kind: string;
@@ -85,6 +102,10 @@ interface ChatNodeStoreView {
 interface ChatSnapshotView {
     order?: readonly string[];
     nodes?: ChatNodeStoreView;
+    /** 按 turn 聚合的节点索引(0.2.x 快照携带;缺席时 chrome 判定容忍降级)。 */
+    locations?: {
+        getTurn(turn: number): readonly string[];
+    };
     legacy?: ChatLegacySliceView;
 }
 /** 0.1.2 ConversationSnapshot：入口是 views store，chat 只是其中一个 target。 */
@@ -114,13 +135,15 @@ interface ClientContext {
     sessions: DshSessions;
     configForms: Pick<ConfigForms, 'get'>;
     get(name: 'uiConversation'): DshUiConversation | undefined;
+    get(name: 'connection'): unknown;
+    get(name: 'conversation'): unknown;
     on?: (name: 'dispose', callback: () => void) => void;
 }
-/** 上下文解析器：安装早于宿主服务启动时，一次性捕获会拿到 undefined，必须按需取。 */
-type Resolver<T> = () => T | undefined;
 export declare function apply(ctx: ClientContext): void;
 interface UserRefreshTarget {
     key: string;
+    /** 目标 user/message 事件 seq（就地回退的 @seq）。 */
+    seq: number;
     turn: number;
     content: unknown[];
     previousTurnEnd: number | undefined;
@@ -130,16 +153,10 @@ interface UserRefreshTarget {
     assistantKeys: string[];
 }
 declare function computeUserRefreshTargets(chat: ChatSnapshotView | undefined): Map<string, UserRefreshTarget>;
-/** 提交 prompt 前，收集重建会话里已有 assistant 的 messageId 基线。 */
-declare function collectBaselineAssistantIds(getUiConversation: Resolver<DshUiConversation>, sessionId: string): Set<string>;
-/**
- * 等待"本次新生成"的 assistant 进入终态：仅 `status === 'settled'` 算成功，
- * `status === 'interrupted'` 算失败/被中断。基线之外的 assistant（含 streaming 中
- * 尚未拿到 messageId 的节点）一律视为"新回复"，不再拿历史回复顶包。
- */
-declare function waitForNewAssistant(getUiConversation: Resolver<DshUiConversation>, sessionId: string, baselineIds: Set<string>, signal: AbortSignal | undefined, timeoutMs?: number): Promise<void>;
 interface RetryContext {
     content: unknown[];
+    /** 所属用户消息的 user/message 事件 seq（就地回退的 @seq）。 */
+    userSeq: number | undefined;
     previousTurnEnd: number | undefined;
     turn: number | undefined;
     assistantStatus: string | undefined;
@@ -151,5 +168,5 @@ interface RetryContext {
 declare function computeRetryContext(chat: ChatSnapshotView | undefined, messageId: string): RetryContext | undefined;
 /** assistant 节点的 messageId：优先 finalNode。 */
 declare function assistantMessageId(node: ChatViewNode): string | undefined;
-export { assistantMessageId, collectBaselineAssistantIds, computeRetryContext, computeUserRefreshTargets, waitForNewAssistant };
+export { assistantMessageId, computeRetryContext, computeUserRefreshTargets };
 //# sourceMappingURL=index.d.ts.map

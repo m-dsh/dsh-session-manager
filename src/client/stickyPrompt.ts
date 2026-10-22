@@ -57,7 +57,6 @@ interface RowBox extends StuckRowBox {
   row: HTMLElement
 }
 
-const EASE = '220ms cubic-bezier(0.22, 1, 0.36, 1)'
 const hideTimers = new WeakMap<HTMLElement, number>()
 const TIME_ONLY = /^\d{1,2}:\d{2}(?::\d{2})?$/
 
@@ -90,22 +89,6 @@ function clearTransform(prompt: HTMLElement): void {
   prompt.style.transition = ''
   prompt.style.transform = ''
   prompt.style.transformOrigin = ''
-}
-
-function placeFrom(prompt: HTMLElement, from: DOMRect, to: DOMRect): void {
-  const scaleX = from.width / Math.max(to.width, 1)
-  const scaleY = from.height / Math.max(to.height, 1)
-  prompt.style.transition = 'none'
-  prompt.style.transformOrigin = 'top left'
-  prompt.style.transform =
-    `translate(${from.left - to.left}px, ${from.top - to.top}px) scale(${scaleX}, ${scaleY})`
-}
-
-function animateToRest(prompt: HTMLElement): void {
-  // 强制一次 reflow 让起始 transform 生效后再过渡
-  prompt.getBoundingClientRect()
-  prompt.style.transition = `transform ${EASE}`
-  prompt.style.transform = 'none'
 }
 
 function textOf(row: HTMLElement): string {
@@ -314,19 +297,16 @@ function renderBar(
     return
   }
 
-  const from = match.row.getBoundingClientRect()
   label.textContent = text
   host.dataset.dshStickyKey = next
   bar.hidden = false
   bar.dataset.dshStickyVisible = '1'
   bindJumpInto(prompt, scroller, next)
 
-  if (reducedMotion()) {
-    clearTransform(prompt)
-    return
-  }
-  placeFrom(prompt, from, prompt.getBoundingClientRect())
-  animateToRest(prompt)
+  // 不做 FLIP 缩放动画：吸附时把提示条按原消息行尺寸放大再收缩，快速
+  // 上滚会反复从放大态播动画（「先变大再恢复」的闪烁源）。提示条恒为
+  // 两行截断的紧凑形态，入场只走已有的透明度淡入。
+  clearTransform(prompt)
 }
 
 /** 安装：滚动容器级监听 + 一次性 resize/Mutation 刷新。清理返回后 DOM 自净。 */
@@ -414,7 +394,6 @@ const STYLES = `
   text-align:right;
   pointer-events:auto;
   cursor:pointer;
-  will-change:transform;
 }
 .dshSessionManagerStickyPrompt:focus-visible{
   outline:none;

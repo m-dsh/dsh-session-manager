@@ -10,8 +10,9 @@ describe('插件 manifest', () => {
     expect(manifest.name).toBe('dsh-session-manager')
     expect(patch).toContain(`name: '${manifest.name}'`)
     expect(patch).toContain(`id: ${manifest.name}`)
-    expect(manifest.dsh.engines.dsh).toBe('>=0.2.0-rc.2')
+    expect(manifest.dsh.engines.dsh).toBe('>=0.2.1-rc.1 <0.3.0-0')
     expect(manifest.dsh.client.inject).toContain('@deepseek-ai/dsh-client-ui-settings')
+    expect(manifest.dsh.client.inject).toContain('@deepseek-ai/dsh-client-ui-conversation')
     if (manifest.dsh?.client) {
       expect(manifest.exports['./client']?.default).toBe('./lib/client.js')
     } else {

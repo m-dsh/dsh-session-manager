@@ -111,7 +111,7 @@ describe('Client 插件入口', () => {
 
     apply(ctx as never)
     expect(applyStickyPrompt).toHaveBeenCalledTimes(1)
-    const enabledNow = vi.mocked(applyStickyPrompt).mock.calls[0][0]
+    const enabledNow = vi.mocked(applyStickyPrompt).mock.calls[0]?.[0] ?? (() => false)
     expect(enabledNow()).toBe(true)
     setValues({ stickyPromptEnabled: true, sessionDeleteEnabled: true })
     expect(applyStickyPrompt).toHaveBeenCalledTimes(1)

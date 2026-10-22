@@ -1,7 +1,10 @@
 import React from 'react'
 import type { ConfigForms } from '@deepseek-ai/dsh-client-ui-settings/client'
-import { CHECKPOINT_API_PATH } from '../core'
 import { applyStickyPrompt } from './stickyPrompt'
+import { ENGINE_COMMAND, hiddenSeqsOf, isExecutedRewindCommand, messageTextAt, type ChatOf, type ChatWatch, type HiddenChat } from './hidden'
+import { closePopover, knownCommandSeqs, openPopover, prewarmPreview, registerComposerFocuser, registerPreviewCall, waitForCommand } from './popover'
+import { previewOverRpc, type ConnectionLike } from './host-rpc'
+import { EDIT_ICON_SVG, REWIND_ICON_SVG, REWIND_STYLE } from './styles'
 import {
   SETTINGS_NAMESPACE,
   SessionManagerSection,
@@ -23,12 +26,29 @@ interface SessionSummary {
   title?: string
   displayTitle?: string
   cwd?: string
+  /** 0.2.x：本地引用计数（mainView>0 即主视图正在展示的会话）。 */
+  retainedBy?: Record<string, number>
 }
 
 interface SessionListState {
   ids: string[]
   byId: Record<string, SessionSummary>
+  /** 老版本字段；0.2.1 起移除，改用 byId[id].retainedBy.mainView。 */
   current?: string
+}
+
+/**
+ * 当前主视图会话 id：优先老版本的 current 字段；0.2.1 起取
+ * retainedBy.mainView > 0 的会话（对齐 dsh-rewind 的 isMainViewSession）。
+ */
+function currentSessionId(sessions: DshSessions): string | undefined {
+  const state = sessions.list.getSnapshot()
+  if (typeof state.current === 'string' && state.current !== '') return state.current
+  const byId = state.byId ?? {}
+  for (const [id, row] of Object.entries(byId)) {
+    if ((row.retainedBy?.mainView ?? 0) > 0) return id
+  }
+  return undefined
 }
 
 interface WorkspaceListState {
@@ -51,8 +71,16 @@ interface DshWorkspaces {
 
 /** 0.1.2：Session.getSnapshot() 只有 queue/running 等控制字段，没有消息节点；
  *  消息上下文必须读 uiConversation 的 chat 视图（其 legacy 切片含 flat nodes + turnEnds）。 */
+interface RemoteCommandResult {
+  ok: boolean
+  value?: { matched?: boolean }
+  error?: { code?: string; message?: string }
+}
+
 interface SessionFace {
   prompt(parts: unknown[], mode: 'queue' | 'steer', signal?: AbortSignal): Promise<unknown>
+  /** 执行一条斜杠命令（纯接纳语义；结局以 chat 视图的 CommandNode 落定）。 */
+  command(line: string): Promise<RemoteCommandResult>
 }
 
 interface DshSessions {
@@ -60,6 +88,8 @@ interface DshSessions {
   binding(id: string): { session: SessionFace } | undefined
   fork(opts: { sessionId: string; atSeq?: number; increaseTitle?: boolean }): Promise<string>
   open(id: string): void
+  /** 会话输入 shell 的作用域键（composer draft 写入需要）。 */
+  scope?(id: string): unknown
 }
 
 interface ConversationNode {
@@ -97,6 +127,8 @@ interface ChatNodeStoreView {
 interface ChatSnapshotView {
   order?: readonly string[]
   nodes?: ChatNodeStoreView
+  /** 按 turn 聚合的节点索引(0.2.x 快照携带;缺席时 chrome 判定容忍降级)。 */
+  locations?: { getTurn(turn: number): readonly string[] }
   legacy?: ChatLegacySliceView
 }
 
@@ -129,6 +161,8 @@ interface ClientContext {
   sessions: DshSessions
   configForms: Pick<ConfigForms, 'get'>
   get(name: 'uiConversation'): DshUiConversation | undefined
+  get(name: 'connection'): unknown
+  get(name: 'conversation'): unknown
   on?: (name: 'dispose', callback: () => void) => void
 }
 
@@ -164,7 +198,7 @@ export function apply(ctx: ClientContext): void {
     if (stickyPrompt && disposeSticky === undefined) {
       disposeSticky = applyStickyPrompt(stickyEnabledNow, () => {
         try {
-          return sessions.list.getSnapshot().current
+          return currentSessionId(sessions)
         } catch {
           return undefined
         }
@@ -215,16 +249,30 @@ export function apply(ctx: ClientContext): void {
           sessionId,
           messageId,
           sessions,
-          workspaces,
           getUiConversation,
         })
       },
     )
   })
 
-  // ── Checkpoint 回滚入口（常驻在每条用户消息 actions 行，DOM 注入）──
-  const disposeCheckpoints = installCheckpointEntries(sessions, workspaces, getUiConversation)
-  ctx.on?.('dispose', disposeCheckpoints)
+  // ── 回退入口（常驻在每条用户消息 actions 行，DOM 注入 + 模式浮层）──
+  const getConversation: Resolver<unknown> = () => {
+    try {
+      return ctx.get('conversation')
+    } catch {
+      return undefined
+    }
+  }
+  const getConnection: Resolver<unknown> = () => {
+    try {
+      return ctx.get('connection')
+    } catch {
+      return undefined
+    }
+  }
+  const disposeRewind = installRewindEntries(sessions, getUiConversation, getConversation, getConnection)
+  ctx.on?.('dispose', disposeRewind)
+  ctx.on?.('dispose', () => closePopover())
 
   ctx.on?.('dispose', () => {
     unsubscribeSettings()
@@ -238,17 +286,7 @@ export function apply(ctx: ClientContext): void {
 //  Checkpoint 回滚入口（DOM 注入到每条用户消息上方，悬浮显示）
 // ═══════════════════════════════════════════════════════════
 
-interface UserCheckpoint {
-  /** 用户消息节点在 chat 视图中的稳定 key，用于匹配 DOM 行 */
-  key: string
-  /** 该条用户消息所属的回合号 */
-  turn: number
-  /** 该回合的用户文本预览 */
-  preview: string
-  /** 回滚边界：上一轮 turn/end 事件 seq（fork 到这里，清除本轮及之后） */
-  forkSeq: number
-}
-
+/** 取用户消息首个文本块(前 80 字)。 */
 function extractUserText(content: unknown[] | undefined): string {
   if (!Array.isArray(content)) return ''
   for (const block of content) {
@@ -263,35 +301,79 @@ function extractUserText(content: unknown[] | undefined): string {
   return ''
 }
 
-// 从 chat 视图精确计算每条用户消息对应的回滚边界。
-function computeUserCheckpoints(chat: ChatSnapshotView | undefined): UserCheckpoint[] {
-  if (!chat) return []
-  const turnEnds = chat.legacy?.turnEnds
-  if (!chat.nodes || !turnEnds) return []
+/** 一条可回退的用户消息：按钮与浮层的目标。 */
+interface RewindCandidate {
+  /** 用户消息节点在 chat 视图中的稳定 key，用于匹配 DOM 行 */
+  key: string
+  /** 目标 user/message 事件 seq（= 节点 anchorSeq；@seq 回退目标） */
+  seq: number
+  /** 该条用户文本预览 */
+  preview: string
+}
 
-  const result: UserCheckpoint[] = []
+/**
+ * 把本仓的 ChatSnapshotView 适配成 hidden 模块的 HiddenChat 读取器：
+ * hidden 的算法按 order+get(key) 消费快照，本仓节点存储只有 values()。
+ */
+function hiddenChatOf(chat: ChatSnapshotView | undefined): HiddenChat | undefined {
+  if (!chat?.nodes) return undefined
+  const byKey = new Map<string, ChatViewNode>()
+  const orderKeys: string[] = []
   for (const node of chat.nodes.values()) {
-    if (node.kind !== 'user' || node.visibility !== 'visible') continue
-    if (typeof node.key !== 'string' || node.key === '') continue
-    // turn 与 step 两类定位都携带 owningTurn；直接读取保证兼容
-    const turn = node.location?.turn?.turn
-    if (typeof turn !== 'number') continue
-    const forkSeq = turnEnds.get(turn - 1)
-    if (typeof forkSeq !== 'number') continue // 第一条用户消息之前没有检查点
-    result.push({
-      key: node.key,
-      turn,
-      preview: extractUserText(node.data?.content),
-      forkSeq,
-    })
+    if (typeof node.key === 'string' && node.key !== '') {
+      byKey.set(node.key, node)
+      orderKeys.push(node.key)
+    }
   }
+  // order 缺席时以 values() 的 key 序合成（老版快照没有 order 字段）。
+  const order = chat.order ?? orderKeys
+  return {
+    order,
+    nodes: {
+      get: (key: string) => {
+        const node = byKey.get(key)
+        if (node === undefined) return undefined
+        return node as never
+      },
+    },
+    // locations 必须透传：turn 摘要行（终止/用时提示）的锚点序号在回退
+    // 目标之前，区间裁剪够不到，只能按「整轮成员全部被撤」判定。
+    ...(chat.locations !== undefined ? { locations: chat.locations } : {}),
+  }
+}
 
-  // 按 chat.order 排序，与 DOM 中行的顺序保持一致
-  const order = chat.order
-  if (order && order.length > 0) {
-    const indexByKey = new Map<string, number>()
-    order.forEach((key, index) => indexByKey.set(key, index))
-    result.sort((a, b) => (indexByKey.get(a.key) ?? 0) - (indexByKey.get(b.key) ?? 0))
+/** key → 节点索引（隐藏判定按行 key 找 anchorSeq）。 */
+function nodeKeyIndex(chat: ChatSnapshotView | undefined): Map<string, ChatViewNode> {
+  const byKey = new Map<string, ChatViewNode>()
+  if (!chat?.nodes) return byKey
+  for (const node of chat.nodes.values()) {
+    if (typeof node.key === 'string' && node.key !== '') byKey.set(node.key, node)
+  }
+  return byKey
+}
+
+/**
+ * 从 chat 视图精确计算每条可回退的用户消息：in-place 方案的目标就是消息
+ * 自身的 seq（不再需要 turnEnds 推 fork 边界）。用户气泡与 steering 插话
+ * 都算（插话尚未被模型读取，同样可撤回）。
+ */
+function computeRewindCandidates(chat: ChatSnapshotView | undefined): RewindCandidate[] {
+  if (!chat?.nodes) return []
+  const byKey = nodeKeyIndex(chat)
+  // order 缺席时以 values() 的 key 序兜底（老版快照没有 order 字段）。
+  const keys = chat.order ?? [...byKey.keys()]
+  const result: RewindCandidate[] = []
+  for (const key of keys) {
+    const node = byKey.get(key)
+    if (node === undefined || (node.kind !== 'user' && node.kind !== 'steering')) continue
+    // 目标 seq：优先 anchorSeq；老视图缺该字段时回落 data.seq（同为事件 seq）。
+    const seq = typeof node.anchorSeq === 'number' ? node.anchorSeq : node.data?.seq
+    if (typeof seq !== 'number') continue
+    result.push({
+      key,
+      seq,
+      preview: extractUserText(node.data?.content),
+    })
   }
   return result
 }
@@ -300,6 +382,8 @@ function computeUserCheckpoints(chat: ChatSnapshotView | undefined): UserCheckpo
 
 interface UserRefreshTarget {
   key: string
+  /** 目标 user/message 事件 seq（就地回退的 @seq）。 */
+  seq: number
   turn: number
   content: unknown[]
   previousTurnEnd: number | undefined
@@ -331,12 +415,17 @@ function computeUserRefreshTargets(chat: ChatSnapshotView | undefined): Map<stri
 
   const turnEnds = chat.legacy?.turnEnds
   for (const node of chat.nodes.values()) {
-    if (node.kind !== 'user' || node.visibility !== 'visible') continue
+    // 0.2.1 视图节点不再携带 visibility 字段：仅显式 hidden 才跳过，
+    // 缺席(undefined)视为可见（老版本取值 'visible' 同样通过）。
+    if (node.kind !== 'user' || node.visibility === 'hidden') continue
     if (typeof node.key !== 'string' || node.key === '') continue
     const turn = node.location?.turn?.turn
     if (typeof turn !== 'number') continue
     const content = node.data?.content
     if (!Array.isArray(content) || content.length === 0) continue
+    // 就地重发需要目标 seq（anchorSeq 优先，老快照回退 data.seq）。
+    const seq = typeof node.anchorSeq === 'number' ? node.anchorSeq : node.data?.seq
+    if (typeof seq !== 'number') continue
 
     let previousTurnEnd: number | undefined
     if (turnEnds) {
@@ -348,6 +437,7 @@ function computeUserRefreshTargets(chat: ChatSnapshotView | undefined): Map<stri
     }
     map.set(node.key, {
       key: node.key,
+      seq,
       turn,
       content: [...content],
       previousTurnEnd,
@@ -480,19 +570,56 @@ function ensureRefreshButton(
 }
 
 const CHECKPOINT_PILL = '[data-dsh-checkpoint-pill="true"]'
-const CHECKPOINT_DIALOG = '[data-dsh-checkpoint-dialog="true"]'
 
 /** actions 容器必须真实持有按钮；空装饰壳（可能匹配 actions 前缀类名）不能当宿主。 */
+/**
+ * 行 → chat 节点：按 0.2.1 的行身份解析——`data-chat-anchor-key`（FLOW key，
+ * step 部件是复合 `["<nodeKey>","<part>"]`）优先，`data-chat-node-key`（纯
+ * 节点 key）兜底，旧版 `data-chat-flow-key` 再兜底。对齐 dsh-rewind 的
+ * resolveSeatAnchorSeq 与官方 viewport 自己的身份读取。
+ */
+function resolveSeatNode(
+  row: HTMLElement,
+  nodesByKey: Map<string, ChatViewNode>,
+): ChatViewNode | undefined {
+  const anchorKey = row.dataset.chatAnchorKey
+  const nodeKey = row.dataset.chatNodeKey
+  const legacyKey = row.getAttribute('data-chat-flow-key')
+  return (anchorKey !== undefined && anchorKey !== '' ? nodesByKey.get(anchorKey) : undefined)
+    ?? (nodeKey !== undefined && nodeKey !== '' ? nodesByKey.get(nodeKey) : undefined)
+    ?? (legacyKey !== null && legacyKey !== '' ? nodesByKey.get(legacyKey) : undefined)
+}
+
+/**
+ * 定位用户行的 actions 容器（复制/分支按钮所在的 IconActions 行）。
+ * 结构性定位：actions 行总是排在行内最后（图片缩略图也是 button 且在前
+ * 面），取「最后一个非本插件按钮」的父元素；失败回落 class 扫描
+ * （老版 DOM）。对齐 dsh-rewind 的 actionsContainerOf。
+ */
+function actionsContainerOf(row: HTMLElement): HTMLElement | undefined {
+  const own = (button: HTMLButtonElement): boolean =>
+    button.dataset.dshCheckpointButton === 'true'
+    || button.dataset.dshCheckpointActionButton === 'true'
+    || button.dataset.dshRefresh === 'true'
+    || button.closest(CHECKPOINT_PILL) !== null
+  const buttons = Array.from(row.querySelectorAll<HTMLButtonElement>('button'))
+  const lastButton = buttons.filter(button => !own(button)).at(-1)
+  const structural = lastButton?.parentElement
+  if (structural instanceof HTMLElement && structural.querySelector('button') !== null) return structural
+  return findActionsRow(row)
+}
+
 function findActionsRow(row: HTMLElement): HTMLElement | undefined {
   const candidates = Array.from(row.querySelectorAll<HTMLElement>('[class*="_actions"], [class*="actions"]'))
   return candidates.find((element) => element.querySelector('button') !== null) ?? candidates[0]
 }
 
-function ensureCheckpointStyle(): void {
+function ensureRewindStyle(): void {
   // HMR/重启可能已经留下旧版 style；必须更新它，而不是只检查后直接返回。
   const style = document.querySelector<HTMLStyleElement>('style[data-dsh-checkpoint-style]') ?? document.createElement('style')
   style.dataset.dshCheckpointStyle = 'true'
   style.textContent = [
+    REWIND_STYLE,
     // 直接作为用户消息 actions 行中的一个按钮，和复制按钮水平对齐并常驻显示。
     `${CHECKPOINT_PILL}{display:contents!important;opacity:1!important;visibility:visible!important;pointer-events:auto!important}`,
     `${CHECKPOINT_PILL}>button{flex:none!important;display:inline-flex!important;align-items:center!important;justify-content:center!important;visibility:visible!important;opacity:1!important;pointer-events:auto!important;cursor:pointer!important}`,
@@ -508,14 +635,16 @@ function currentSessionSnapshot(
   sessions: DshSessions,
   getUiConversation: Resolver<DshUiConversation>,
 ): { sessionId: string; chat?: ChatSnapshotView } | undefined {
-  const state = sessions.list.getSnapshot()
-  const sessionId = state.current
+  const sessionId = currentSessionId(sessions)
   if (!sessionId) return undefined
   let chat: ChatSnapshotView | undefined
   try {
-    // 0.1.2：会话绑定不再挂 ConversationSnapshot，改从 uiConversation 的 views 取 chat target。
     const binding = getUiConversation()?.binding(sessionId)
-    chat = binding?.snapshot?.getSnapshot()?.views?.get('chat') ?? undefined
+    // 0.2.1：chat 视图经 binding(id).target('chat') 读取（dsh-rewind 的方式）；
+    // 老版本回落 snapshot.getSnapshot().views.get('chat')。
+    chat = binding?.target?.('chat')?.getSnapshot()
+      ?? binding?.snapshot?.getSnapshot()?.views?.get('chat')
+      ?? undefined
   } catch {
     chat = undefined
   }
@@ -527,37 +656,97 @@ function removeAllCheckpointPills(): void {
 }
 
 
-function createCheckpointPill(cp: UserCheckpoint, key: string, onOpen: () => void): HTMLElement {
-  const pill = document.createElement('div')
-  pill.dataset.dshCheckpointPill = 'true'
-  pill.dataset.dshCheckpointKey = key
-
-  const button = document.createElement('button')
-  button.type = 'button'
-  button.textContent = `↩ 回滚 #${cp.turn}`
-  button.title = cp.preview ? `回滚到第 ${cp.turn} 轮之前：${cp.preview}` : `回滚到第 ${cp.turn} 轮之前`
-  button.dataset.dshCheckpointButton = 'true'
-  attachCheckpointAction(button, onOpen)
-  pill.appendChild(button)
-  return pill
+/** ✎ 编辑图标（与 ↶ 同一套视觉参数）。 */
+function editIcon(): Element {
+  const template = document.createElement('template')
+  template.innerHTML = EDIT_ICON_SVG.trim()
+  const icon = template.content.firstElementChild
+  if (icon === null) throw new Error('edit icon svg is empty')
+  return icon
 }
 
-function attachCheckpointAction(button: HTMLButtonElement, onOpen: () => void): void {
-  const activate = (event: Event) => {
+/** dsh-rewind 的 ↶ 图标（内联 SVG，描边 1.25 与相邻操作按钮对齐）。 */
+function rewindIcon(): Element {
+  const template = document.createElement('template')
+  template.innerHTML = REWIND_ICON_SVG.trim()
+  const icon = template.content.firstElementChild
+  if (icon === null) throw new Error('rewind icon svg is empty')
+  return icon
+}
+
+/**
+ * 绑定按钮的回退动作：pointerdown 捕获点击意图（避免宿主在 click 前重绘
+ * 吞掉事件），并顺带预取 preview——按下到弹起的窗口足够覆盖探测往返，
+ * 浮层打开时直接以落定态渲染。
+ */
+function attachCheckpointAction(button: HTMLButtonElement, onOpen: () => void, onPrewarm?: () => void): void {
+  const prewarm = (event: Event): void => {
+    event.preventDefault()
+    event.stopPropagation()
+    try {
+      onPrewarm?.()
+    } catch {
+      // 预取失败留给 open 时的正常路径。
+    }
+  }
+  const activate = (event: Event): void => {
     event.preventDefault()
     event.stopPropagation()
     onOpen()
   }
-  // 使用 pointerdown 捕获点击意图，避免宿主消息层在 click 前重绘/吞掉事件。
-  button.addEventListener('pointerdown', activate, true)
+  button.addEventListener('pointerdown', prewarm, true)
   button.addEventListener('click', activate, true)
+}
+
+function createRewindPill(cp: RewindCandidate, key: string, onOpen: () => void, onPrewarm?: () => void, onEdit?: () => void): HTMLElement {
+  const pill = document.createElement('div')
+  pill.dataset.dshCheckpointPill = 'true'
+  pill.dataset.dshCheckpointKey = key
+
+  // 回退按钮（首个;复制模板克隆只认它）
+  const button = document.createElement('button')
+  button.type = 'button'
+  button.setAttribute('aria-label', '回退到这条消息')
+  button.title = cp.preview ? `回退到这条消息：${cp.preview}` : '回退到这条消息'
+  button.dataset.dshCheckpointButton = 'true'
+  button.replaceChildren(rewindIcon())
+  attachCheckpointAction(button, onOpen, onPrewarm)
+  pill.appendChild(button)
+
+  // 编辑按钮：回退到这条消息并把文本回填输入框，改完手动重发。
+  // 不参与复制模板克隆（克隆只替换首个按钮），用与刷新按钮一致的静态样式。
+  if (onEdit !== undefined) {
+    const editButton = document.createElement('button')
+    editButton.type = 'button'
+    editButton.dataset.dshEditButton = 'true'
+    editButton.setAttribute('aria-label', '编辑这条消息')
+    editButton.title = '编辑这条消息并重发（撤回它及其后的对话）'
+    editButton.style.cssText = [
+      'background:transparent', 'border:none', 'border-radius:28px', 'cursor:pointer', 'padding:6px',
+      'display:inline-flex', 'justify-content:center', 'align-items:center',
+      'color:var(--dsw-alias-label-tertiary)', 'width:28px', 'height:28px',
+    ].join(';')
+    editButton.addEventListener('mouseenter', () => {
+      editButton.style.background = 'var(--dsw-alias-interactive-bg-hover)'
+      editButton.style.color = 'var(--dsw-alias-label-secondary)'
+    })
+    editButton.addEventListener('mouseleave', () => {
+      editButton.style.background = 'transparent'
+      editButton.style.color = 'var(--dsw-alias-label-tertiary)'
+    })
+    editButton.replaceChildren(editIcon())
+    attachCheckpointAction(editButton, onEdit)
+    pill.appendChild(editButton)
+  }
+  return pill
 }
 
 function adoptCopyButtonStyle(
   pill: HTMLElement,
   actions: HTMLElement,
-  cp: UserCheckpoint,
+  cp: RewindCandidate,
   onOpen: () => void,
+  onPrewarm?: () => void,
 ): void {
   const current = pill.querySelector('button') as HTMLButtonElement | null
   if (!current || current.dataset.dshCopyStyle === 'true') return
@@ -570,473 +759,45 @@ function adoptCopyButtonStyle(
   const replacement = template.cloneNode(true) as HTMLButtonElement
   replacement.dataset.dshCopyStyle = 'true'
   replacement.dataset.dshCheckpointActionButton = 'true'
-  replacement.setAttribute('aria-label', `回滚到第 ${cp.turn} 轮之前`)
-  replacement.title = cp.preview ? `回滚到第 ${cp.turn} 轮之前：${cp.preview}` : `回滚到第 ${cp.turn} 轮之前`
-  // 复用复制按钮的尺寸、间距和 class，但使用回滚符号避免误认为复制。
-  replacement.replaceChildren(document.createTextNode('↩'))
+  replacement.setAttribute('aria-label', '回退到这条消息')
+  replacement.title = cp.preview ? `回退到这条消息：${cp.preview}` : '回退到这条消息'
+  // 复用复制按钮的尺寸、间距和 class，但用回退图标避免误认为复制。
+  replacement.replaceChildren(rewindIcon())
   current.replaceWith(replacement)
-  attachCheckpointAction(replacement, onOpen)
+  attachCheckpointAction(replacement, onOpen, onPrewarm)
 }
 
-/** 宿主 preview-rollback 返回的回滚计划（只读预演，未改任何文件）。 */
-interface RollbackPreview {
-  /** 宿主托管的执行计划 id：apply-rollback 时只提交它，不能自行传文件路径。 */
-  planId: string
-  /** 将被写回的文件。 */
-  restore: string[]
-  /** 快照里记录的文件总数（诊断用，界面不展示）。 */
-  snapshotFiles: number
-  /** 将被删除的文件。 */
-  remove: string[]
-  /** 因"不是本次对话改动的文件"而跳过的文件（最多 50 条）。 */
-  skipped: string[]
-  skippedCount: number
-  /** 是否成功限定为"本次对话动过的文件"。 */
-  scoped: boolean
-  unknownSnapshots: number
-  /** exact=精确快照可用；missing=禁止文件回滚。 */
-  snapshotStatus: 'exact' | 'missing'
-  /** 精确快照是否已持久化（false=重启后丢失，仅本进程可用）。 */
-  persisted: boolean
-  hasSnapshot: boolean
-  snapshotSeq?: number
-  isGit: boolean
-  /** 无法安全恢复的文件；非空时禁止文件回滚。 */
-  unsupported: Array<{ path: string; reason: string }>
-}
+/** 就地重发钩子：installRewindEntries 装配时写入,卸载时清除;RetryButton 经它复用同一管线。 */
+let regenerateHook: ((sessionId: string, seq: number) => Promise<void>) | undefined
 
-/** 对话框 UI 句柄：DOM 操作收在一处，回滚流程只调用这些方法。 */
-interface RollbackUi {
-  /** 进入工作态：显示进度条与步骤提示，隐藏两个动作按钮。 */
-  begin(): void
-  /** 更新进度（0-100）与步骤提示；step 为空表示清空提示。 */
-  progress(percent: number, step: string): void
-  /** 明细列表（逐行、自动滚到底）。 */
-  detail(items: string[]): void
-  /** 出错：红色提示 + 还原动作按钮，允许重试。 */
-  fail(text: string): void
-  /** 终态：汇总 + 明细 + 关闭按钮，进度条保持满格。 */
-  done(summary: string, isError: boolean, items?: string[]): void
-}
-
-/** 调一次 checkpoint 接口（/api exact Fetch 路由），失败时抛出带宿主错误信息的 Error。 */
-async function callCheckpoint<T>(endpoint: string, payload: unknown): Promise<T> {
-  const response = await fetch(CHECKPOINT_API_PATH, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ endpoint, payload }),
-  })
-  if (!response.ok) throw new Error(`${endpoint} 失败（HTTP ${response.status}）`)
-  const result = (await response.json()) as { ok: boolean; value?: unknown; error?: { message?: string } }
-  if (!result.ok) {
-    throw new Error(result.error?.message ?? `${endpoint} 失败`)
-  }
-  return result.value as T
-}
-
-function openRollbackDialog(
-  cp: UserCheckpoint,
+/**
+ * 回退入口安装（常驻在每条用户消息 actions 行，DOM 注入）：
+ * - ↶ 按钮 + 模式浮层（chat / both+影响清单）
+ * - 被撤回行的隐藏（data-dsh-rewind-hidden，观测性标记）
+ * - 回退成功后把目标消息文本回填 composer
+ * 保留本仓原有的 MutationObserver + actions 行适配骨架（不引 React portal）。
+ */
+function installRewindEntries(
   sessions: DshSessions,
-  workspaces: DshWorkspaces,
-): void {
-  document.querySelector(CHECKPOINT_DIALOG)?.remove()
-
-  const overlay = document.createElement('div')
-  overlay.dataset.dshCheckpointDialog = 'true'
-  overlay.style.cssText = 'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.3)'
-
-  const card = document.createElement('div')
-  // position:relative + overflow:hidden：顶部进度条正好贴住卡片上边框与圆角。
-  card.style.cssText = 'position:relative;overflow:hidden;background:var(--dsw-alias-bg-primary,#fff);border-radius:12px;padding:24px;min-width:360px;max-width:440px;box-shadow:0 8px 32px rgba(0,0,0,0.18);color:var(--dsw-alias-label-primary,#101828)'
-
-  // ── 顶部进度条（贴在边框上）──
-  const progressTrack = document.createElement('div')
-  progressTrack.style.cssText = 'display:none;position:absolute;left:0;right:0;top:0;height:4px;background:var(--dsw-alias-bg-tertiary,#eaecf0)'
-  const progressFill = document.createElement('div')
-  progressFill.style.cssText = 'height:100%;width:0;background:var(--dsw-alias-state-success-primary,#12b76a);transition:width 200ms ease'
-  progressTrack.appendChild(progressFill)
-  card.appendChild(progressTrack)
-
-  const title = document.createElement('div')
-  title.style.cssText = 'font-size:15px;font-weight:600;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center'
-  const titleText = document.createElement('span')
-  titleText.textContent = `撤销第 ${cp.turn} 轮及之后`
-  const close = document.createElement('button')
-  close.type = 'button'
-  close.textContent = '×'
-  close.setAttribute('aria-label', '关闭')
-  close.style.cssText = 'background:none;border:none;font-size:18px;cursor:pointer;color:var(--dsw-alias-label-tertiary,#98a2b3);padding:0 4px;line-height:1'
-  close.addEventListener('click', () => overlay.remove())
-  title.append(titleText, close)
-  card.appendChild(title)
-
-  if (cp.preview) {
-    const preview = document.createElement('div')
-    preview.textContent = cp.preview
-    preview.style.cssText = 'font-size:12px;color:var(--dsw-alias-label-tertiary,#98a2b3);margin-bottom:16px;padding:8px 10px;background:var(--dsw-alias-bg-secondary,#f9fafb);border-radius:6px;max-height:48px;overflow:hidden;line-height:1.4'
-    card.appendChild(preview)
-  }
-
-  // ── 步骤提示（进度条下方的文字）──
-  const status = document.createElement('div')
-  status.dataset.dshCheckpointStatus = 'true'
-  status.style.cssText = 'display:none;font-size:12px;margin-top:10px;color:var(--dsw-alias-label-secondary,#475467);line-height:1.5'
-  card.appendChild(status)
-
-  const message = document.createElement('div')
-  message.style.cssText = 'font-size:12px;margin-top:10px;display:none;line-height:1.5'
-  card.appendChild(message)
-
-  // 明细列表：恢复/撤销/失败的文件名逐行显示在可滚动区域。
-  const details = document.createElement('div')
-  details.dataset.dshCheckpointDetails = 'true'
-  details.style.cssText = 'display:none;margin-top:8px;max-height:150px;overflow:auto;font-size:11px;line-height:1.6;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dsw-alias-label-secondary,#475467);background:var(--dsw-alias-bg-secondary,#f9fafb);border-radius:6px;padding:8px 10px;white-space:pre-wrap;word-break:break-all'
-  card.appendChild(details)
-
-  const footer = document.createElement('div')
-  footer.style.cssText = 'display:none;margin-top:12px;justify-content:flex-end'
-  const doneButton = document.createElement('button')
-  doneButton.type = 'button'
-  doneButton.dataset.dshCheckpointDone = 'true'
-  doneButton.textContent = '关闭'
-  doneButton.style.cssText = 'padding:6px 16px;font-size:12px;border-radius:6px;cursor:pointer;border:1px solid var(--dsw-alias-border-secondary,#d0d5dd);background:var(--dsw-alias-bg-primary,#fff);color:var(--dsw-alias-label-primary,#101828)'
-  doneButton.addEventListener('click', () => overlay.remove())
-  footer.appendChild(doneButton)
-  card.appendChild(footer)
-
-  const showMessage = (text: string, isError: boolean) => {
-    message.textContent = text
-    message.style.display = text ? 'block' : 'none'
-    message.style.color = isError
-      ? 'var(--dsw-alias-state-error-primary,#d92d20)'
-      : 'var(--dsw-alias-state-success-primary,#12b76a)'
-  }
-
-  const actionButtons = (): HTMLButtonElement[] =>
-    Array.from(card.querySelectorAll<HTMLButtonElement>('button[data-dsh-checkpoint-action]'))
-
-  // 工作态计时：慢步骤（git restore / 大快照）时让用户看到"还在动"。
-  let startedAt = 0
-  let stepText = ''
-  let ticker: ReturnType<typeof setInterval> | undefined
-  const stopTicker = () => {
-    if (ticker !== undefined) clearInterval(ticker)
-    ticker = undefined
-  }
-  const renderStatus = () => {
-    if (!stepText) {
-      status.textContent = ''
-      return
-    }
-    const seconds = Math.round((Date.now() - startedAt) / 1000)
-    status.textContent = seconds >= 2 ? `${stepText}（已用 ${seconds} 秒）` : stepText
-  }
-
-  const ui: RollbackUi = {
-    begin() {
-      startedAt = Date.now()
-      progressTrack.style.display = 'block'
-      status.style.display = 'block'
-      progressFill.style.background = 'var(--dsw-alias-state-success-primary,#12b76a)'
-      showMessage('', false)
-      details.style.display = 'none'
-      for (const action of actionButtons()) action.style.display = 'none'
-      if (ticker === undefined) ticker = setInterval(renderStatus, 500)
-    },
-    progress(percent, step) {
-      progressFill.style.width = `${Math.max(0, Math.min(100, percent))}%`
-      stepText = step
-      renderStatus()
-    },
-    detail(items) {
-      details.textContent = items.join('\n')
-      details.style.display = items.length > 0 ? 'block' : 'none'
-      details.scrollTop = details.scrollHeight
-    },
-    fail(text) {
-      stopTicker()
-      stepText = ''
-      progressFill.style.background = 'var(--dsw-alias-state-error-primary,#d92d20)'
-      progressFill.style.width = '100%'
-      renderStatus()
-      showMessage(text, true)
-      footer.style.display = 'flex'
-      // 失败可重试：动作按钮放回来。
-      for (const action of actionButtons()) {
-        action.style.display = ''
-        action.disabled = false
-      }
-      progressTrack.style.display = 'none'
-    },
-    done(summary, isError, items = []) {
-      stopTicker()
-      stepText = ''
-      progressFill.style.background = isError
-        ? 'var(--dsw-alias-state-error-primary,#d92d20)'
-        : 'var(--dsw-alias-state-success-primary,#12b76a)'
-      progressFill.style.width = '100%'
-      renderStatus()
-      showMessage(summary, isError)
-      ui.detail(items)
-      footer.style.display = 'flex'
-    },
-  }
-
-  // ── 打开即预演：先把"将要回滚什么"填到选项提示里 ──
-  let planState: 'loading' | 'ready' | 'error' = 'loading'
-  let plan: RollbackPreview | undefined
-  const fileOptionHint = (): string => {
-    const tail = `清除第 ${cp.turn} 轮及之后的所有对话记录，并回滚工作区文件`
-    if (planState === 'loading') return `${tail}（正在读取检查点快照…）`
-    if (planState === 'error' || !plan) return `${tail}（预演失败：无法确认文件变更范围，不会执行文件回滚）`
-    if (plan.snapshotStatus === 'missing') {
-      return `${tail}：该检查点没有精确的文件快照，无法回滚文件（可改用「仅回滚对话」）`
-    }
-    if (!plan.hasSnapshot) return `${tail}：该检查点没有文件快照，只能恢复 git 跟踪文件`
-    if (plan.unsupported.length > 0) {
-      return `${tail}：${plan.unsupported.length} 个文件无法安全恢复，已禁止文件回滚`
-    }
-    const parts = [`清除第 ${cp.turn} 轮及之后的对话`]
-    parts.push(plan.restore.length > 0 ? `只回滚本次对话改动的 ${plan.restore.length} 个文件` : '文件无需改动')
-    if (plan.remove.length > 0) parts.push(`撤销 ${plan.remove.length} 个新增文件`)
-    if (!plan.scoped) parts.push('（归属信息不完整，将按全工作区回滚）')
-    else if (plan.skippedCount > 0) parts.push(`（跳过 ${plan.skippedCount} 个非本次对话的改动）`)
-    if (plan.persisted === false) parts.push('（快照未持久化，重启后不可用）')
-    return parts.join('，')
-  }
-
-  /**
-   * 点击前就把"将回滚什么"摊开给用户看，避免回滚完才发现多撤了东西。
-   * 只列会被回滚的内容：与检查点一致的文件、非本次对话改动的文件都不展示，
-   * 只有"没有活可干"时才用一句话说明原因（否则纯属噪声）。
-   */
-  const renderPlan = (value: RollbackPreview): void => {
-    const lines: string[] = []
-    if (value.restore.length > 0) {
-      lines.push(`将回滚（本次对话改动，${value.restore.length}）`)
-      for (const file of value.restore.slice(0, 30)) lines.push(`  ${file}`)
-      if (value.restore.length > 30) lines.push(`  …另有 ${value.restore.length - 30} 个`)
-    }
-    if (value.remove.length > 0) {
-      if (lines.length > 0) lines.push('')
-      lines.push(`将删除（检查点后新增，${value.remove.length}）`)
-      for (const file of value.remove.slice(0, 30)) lines.push(`  ${file}`)
-      if (value.remove.length > 30) lines.push(`  …另有 ${value.remove.length - 30} 个`)
-    }
-    if (lines.length === 0) {
-      lines.push(value.snapshotStatus === 'missing' ? '该检查点没有精确文件快照，无法回滚文件'
-        : value.hasSnapshot ? '文件与检查点一致，无需改动'
-        : '该检查点没有文件快照，只能恢复 git 跟踪的文件')
-    }
-    for (const item of value.unsupported) {
-      lines.push('', `无法安全恢复：${item.path}（${item.reason}）`)
-    }
-    if (value.snapshotStatus === 'exact' && value.persisted === false) {
-      lines.push('', '注意：该快照未成功持久化，重启后不可用。')
-    }
-    if (!value.scoped && value.unknownSnapshots > 0) {
-      lines.push(
-        '',
-        `注意：窗口内 ${value.unknownSnapshots} 个检查点缺少文件归属信息，本次按全工作区回滚（会把上表之外的其他改动一并撤销）。`,
-      )
-    }
-    ui.detail(lines)
-  }
-
-  const makeAction = (label: string, hintOf: () => string, withFiles: boolean) => {
-    const action = document.createElement('button')
-    action.type = 'button'
-    action.dataset.dshCheckpointAction = 'true'
-    // 两个选项保持完全一致的普通按钮样式，不表示默认选中状态。
-    action.style.cssText = 'width:100%;padding:10px 14px;font-size:13px;border-radius:8px;cursor:pointer;text-align:left;line-height:1.4;border:1px solid var(--dsw-alias-border-secondary,#d0d5dd);background:var(--dsw-alias-bg-primary,#fff);color:var(--dsw-alias-label-primary,#101828)'
-    const labelDiv = document.createElement('div')
-    labelDiv.textContent = label
-    const hintDiv = document.createElement('div')
-    hintDiv.style.cssText = 'font-size:11px;margin-top:2px;color:var(--dsw-alias-label-tertiary,#98a2b3)'
-    action.append(labelDiv, hintDiv)
-    const refreshHint = () => {
-      hintDiv.textContent = hintOf()
-    }
-    refreshHint()
-    hintRefreshers.push(refreshHint)
-    action.addEventListener('click', () => {
-      void performRollback(cp, withFiles, sessions, workspaces, ui, () => plan)
-    })
-    return action
-  }
-
-  const hintRefreshers: Array<() => void> = []
-  const group = document.createElement('div')
-  group.style.cssText = 'display:flex;flex-direction:column;gap:8px'
-  group.appendChild(
-    makeAction('仅回滚对话', () => `清除第 ${cp.turn} 轮及之后的所有对话记录，不恢复文件变更`, false),
-  )
-  group.appendChild(makeAction('回滚对话 + 文件', fileOptionHint, true))
-  card.appendChild(group)
-
-  overlay.appendChild(card)
-  overlay.addEventListener('click', (event) => {
-    if (event.target === overlay) overlay.remove()
-  })
-  document.body.appendChild(overlay)
-
-  // 预演请求（只读）：失败就退回静态提示，不影响回滚本身。
-  void callCheckpoint<RollbackPreview>('preview-rollback', {
-    sessionId: sessions.list.getSnapshot().current,
-    checkpointSeq: cp.forkSeq,
-  })
-    .then((value) => {
-      plan = value
-      planState = 'ready'
-      renderPlan(value)
-    })
-    .catch(() => {
-      planState = 'error'
-    })
-    .finally(() => {
-      for (const refresh of hintRefreshers) refresh()
-    })
-}
-
-/** 防止双击 / 连续点击触发两次回滚。 */
-let rollbackInFlight = false
-
-async function performRollback(
-  cp: UserCheckpoint,
-  withFiles: boolean,
-  sessions: DshSessions,
-  workspaces: DshWorkspaces,
-  ui: RollbackUi,
-  getPlan: () => RollbackPreview | undefined,
-): Promise<void> {
-  if (rollbackInFlight) {
-    ui.fail('正在执行回滚，请稍候')
-    return
-  }
-  rollbackInFlight = true
-  try {
-    const sessionId = sessions.list.getSnapshot().current
-    if (!sessionId) {
-      ui.fail('无法确定当前会话')
-      return
-    }
-
-    ui.begin()
-
-    // ── 1) 预演：文件回滚必须有精确的、Host 校验过的计划，否则直接短路 ──
-    let preview = getPlan()
-    if (withFiles && !preview) {
-      ui.progress(6, '正在读取检查点快照…')
-      preview = await callCheckpoint<RollbackPreview>('preview-rollback', {
-        sessionId,
-        checkpointSeq: cp.forkSeq,
-      })
-    }
-    if (withFiles) {
-      if (!preview || preview.snapshotStatus !== 'exact' || !preview.planId) {
-        ui.fail('该检查点没有精确的文件快照，无法回滚文件。可改用「仅回滚对话」。')
-        return
-      }
-      if (preview.unsupported.length > 0) {
-        ui.fail(
-          `以下文件无法安全恢复，已取消文件回滚（可改用「仅回滚对话」）：\n${preview.unsupported
-            .map((item) => `  ${item.path}（${item.reason}）`)
-            .join('\n')}`,
-        )
-        return
-      }
-    }
-
-    // ── 2) 文件先执行：Host 按计划复核哈希后写回/删除；有问题就到此为止，不 fork ──
-    let applyResult: { restored: string[]; removed: string[]; conflicts: string[]; errors: string[] } | undefined
-    if (withFiles && preview) {
-      const plan = preview
-      const workCount = plan.restore.length + plan.remove.length
-      ui.progress(30, `正在校验并按计划回滚 ${workCount} 个文件…`)
-      ui.detail([])
-      applyResult = await callCheckpoint<{ restored: string[]; removed: string[]; conflicts: string[]; errors: string[] }>(
-        'apply-rollback',
-        { planId: plan.planId },
-      )
-      const conflicts = applyResult.conflicts ?? []
-      const errors = applyResult.errors ?? []
-      if (conflicts.length > 0 || errors.length > 0) {
-        const detail = [
-          ...(conflicts.length > 0 ? ['', `以下文件预演后被改动，已按安全规则跳过（${conflicts.length}）：`, ...conflicts] : []),
-          ...(errors.length > 0 ? ['', `以下文件处理失败（${errors.length}）：`, ...errors] : []),
-        ]
-        ui.done('文件回滚未完全成功，已取消对话回滚（原会话保持不变）。', true, detail)
-        return
-      }
-    }
-
-    // ── 3) 文件 OK，再回滚对话：fork 到检查点之前 ──
-    ui.progress(78, `正在清除第 ${cp.turn} 轮及之后的对话…`)
-    const convData = await callCheckpoint<{ newSessionId: string }>('rollback-conversation', {
-      sessionId,
-      checkpointSeq: cp.forkSeq,
-    })
-    sessions.open(convData.newSessionId)
-
-    if (!withFiles) {
-      // 回滚成功即删除被回滚掉的原会话，避免列表里积累多份重复记录。
-      await archiveQuietly(workspaces, sessionId)
-      ui.done(`已回滚对话：已清除第 ${cp.turn} 轮及之后的记录，并切换到新会话`, false)
-      return
-    }
-
-    const restored = applyResult?.restored ?? []
-    const removed = applyResult?.removed ?? []
-    await archiveQuietly(workspaces, sessionId)
-
-    const parts = [`已回滚对话和文件：清除第 ${cp.turn} 轮及之后的对话`]
-    if (restored.length > 0) parts.push(`写回 ${restored.length} 个有改动的文件`)
-    if (removed.length > 0) parts.push(`撤销 ${removed.length} 个新增文件`)
-    if (restored.length === 0 && removed.length === 0) {
-      parts.push(preview?.hasSnapshot ? '文件与检查点一致，无需改动' : '该检查点没有文件快照，未改动文件')
-    }
-    const scopeNote =
-      preview && !preview.scoped && preview.unknownSnapshots > 0
-        ? '注意：窗口内存在缺少归属信息的检查点，本次按全工作区回滚。'
-        : ''
-    ui.done(`${parts.join('，')}。${scopeNote}`, false, [
-      ...restored.map((file) => `写回 ${file}`),
-      ...removed.map((file) => `撤销新增 ${file}`),
-    ])
-  } catch (err) {
-    ui.fail(toErrorMessage(err))
-  } finally {
-    rollbackInFlight = false
-  }
-}
-
-async function archiveQuietly(workspaces: DshWorkspaces, sessionId: string): Promise<void> {
-  try {
-    await workspaces.archiveSession(sessionId)
-  } catch {
-    // 清理原会话失败不覆盖回滚结果。
-  }
-}
-
-function installCheckpointEntries(
-  sessions: DshSessions,
-  workspaces: DshWorkspaces,
   getUiConversation: Resolver<DshUiConversation>,
+  getConversation: () => unknown,
+  getConnection: Resolver<unknown>,
 ): () => void {
   if (typeof document === 'undefined') return () => undefined
 
-  ensureCheckpointStyle()
+  ensureRewindStyle()
+
+  // 影响预览走 Connection RPC（不产生会话日志事件）；连接缺席时预览报错，
+  // 回退执行不受影响（走会话命令通道）。
+  registerPreviewCall((sessionId, seq) =>
+    previewOverRpc(getConnection() as ConnectionLike | undefined, sessionId, seq))
 
   let disposed = false
   let syncing = false
-  let timer: ReturnType<typeof setTimeout> | undefined
   let lastDebugSignature = ''
-  // 每次 sync 更新的最新 refresh 目标：click 闭包可能绑定较旧 target，运行时按 key 取最新。
-  let latestRefreshTargets = new Map<string, UserRefreshTarget>()
 
   // 排查用：浏览器控制台执行
   // localStorage.setItem('dshSessionManagerDebug', '1')
-  // 打开诊断；签名变化时输出一行状态，方便定位卡在数据层还是 DOM 适配层。
   const debugEnabled = (): boolean => {
     try {
       return window.localStorage.getItem('dshSessionManagerDebug') === '1'
@@ -1045,31 +806,20 @@ function installCheckpointEntries(
     }
   }
 
+  // 每次 sync 更新的最新 refresh 目标：click 闭包可能绑定较旧 target，运行时按 key 取最新。
+  let latestRefreshTargets = new Map<string, UserRefreshTarget>()
+
   /** 用户消息「刷新」：共用重新生成核心；成功即替换原回答（原会话归档）。 */
   const runRefresh = (target: UserRefreshTarget, button: HTMLButtonElement): void => {
-    const sessionId = sessions.list.getSnapshot().current
+    const sessionId = currentSessionId(sessions)
     if (!sessionId) return
-    // 取最新 target（闭包里的可能较旧），保证即时占位与 fork 边界一致。
+    // 取最新 target（闭包里的可能较旧），保证 seq 与当前视图一致。
     const current = latestRefreshTargets.get(target.key) ?? target
     button.disabled = true
     button.style.opacity = '0.5'
-    // 点击瞬间降暗该轮回答并占位“正在回复中…”，消除 fork 等待期的卡顿感。
+    // 点击瞬间降暗该轮回答并占位“正在回复中…”，覆盖回退往返的短窗口。
     const restore = showRegeneratingPlaceholder(current.assistantKeys, current.turn)
-    void regenerateTurn(
-      {
-        sessionId,
-        sourceKey: `user:${current.key}`,
-        content: current.content,
-        previousTurnEnd: current.previousTurnEnd,
-        turn: current.turn,
-      },
-      { sessions, workspaces, getUiConversation },
-    )
-      .then(async (replacementSessionId) => {
-        // 先切到新会话再归档原会话（正在查看的会话不能先删）。
-        if (sessions.list.getSnapshot().current === sessionId) sessions.open(replacementSessionId)
-        await archiveQuietly(workspaces, sessionId)
-      })
+    void regenerateInPlace(sessionId, current.seq)
       .catch((error) => {
         button.title = `刷新失败：${toErrorMessage(error)}`
       })
@@ -1080,15 +830,385 @@ function installCheckpointEntries(
       })
   }
 
+  /** 某会话的 chat 视图快照（读取失败降级 undefined）。 */
+  const chatViewOf = (sessionId: string): ChatSnapshotView | undefined => {
+    try {
+      const binding = getUiConversation()?.binding(sessionId)
+      return binding?.target?.('chat')?.getSnapshot()
+        ?? binding?.snapshot?.getSnapshot()?.views?.get('chat')
+        ?? undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /** hidden 模块的 chat 读取器（order + get(key)）。 */
+  const chatOf: ChatOf = (session) => hiddenChatOf(session === undefined ? undefined : chatViewOf(session.sessionId))
+
+  /** chat 快照更新信号：等待命令结局时被唤醒。 */
+  const watchChat: ChatWatch = (sessionId, cb) => {
+    try {
+      return getUiConversation()?.binding(sessionId)?.target?.('chat')?.subscribe?.(cb) ?? (() => {})
+    } catch {
+      return () => {}
+    }
+  }
+
+  /** composer 的 DOM 兜底：直接写 contenteditable（Lexical 经 input 事件接管）。 */
+  const fillComposerEditable = (text: string): boolean => {
+    const editable = document.querySelector<HTMLElement>('[data-composer-input]')
+    if (editable === null) return false
+    editable.focus()
+    const selection = document.getSelection()
+    if (selection !== null) {
+      const range = document.createRange()
+      range.selectNodeContents(editable)
+      selection.removeAllRanges()
+      selection.addRange(range)
+    }
+    let ok = false
+    try {
+      ok = document.execCommand('insertText', false, text)
+    } catch {
+      ok = false
+    }
+    if (ok) return true
+    editable.textContent = text
+    editable.dispatchEvent(new Event('input', { bubbles: true }))
+    return true
+  }
+
+  /**
+   * composer 写入：优先宿主 conversation.input 的 setDraft（整稿替换），
+   * 失败降级 DOM contenteditable。绝不抛错。
+   */
+  const writeComposer = (sessionId: string, text: string): boolean => {
+    try {
+      const conversation = getConversation() as {
+        input?: { for(actx: unknown): { setDraft(text: string): void; focus?(): void } }
+      } | undefined
+      const scope = sessions.scope?.(sessionId)
+      const facade = conversation?.input !== undefined && scope !== undefined
+        ? conversation.input.for(scope)
+        : undefined
+      if (facade !== undefined) {
+        try {
+          facade.setDraft(text)
+          try {
+            facade.focus?.()
+          } catch {
+            // 聚焦是表现层；回填的草稿才是重点。
+          }
+          return true
+        } catch {
+          // facade 抛错（会话拆除窗口）视作缺席，走 DOM 通道。
+        }
+      }
+    } catch {
+      // 读取失败走 DOM 通道。
+    }
+    return fillComposerEditable(text)
+  }
+
+  /** 用 Enter 提交 composer（就地重发的最后一步）。 */
+  const submitComposer = (): boolean => {
+    const editable = document.querySelector<HTMLElement>('[data-composer-input]')
+    if (editable === null) return false
+    editable.focus()
+    editable.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+    return true
+  }
+
+  // ── 行内编辑器:点 ✎ 时消息原位变输入框,确定时才回退并发送改后文本 ──
+  let editingRow: HTMLElement | null = null
+
+  /** 关闭编辑器并还原消息原样(取消/成功后/开新编辑器时调用)。 */
+  const closeEditor = (): void => {
+    if (editingRow === null) return
+    editingRow.removeAttribute('data-dsh-editing')
+    editingRow.querySelector('[data-dsh-edit-editor]')?.remove()
+    editingRow = null
+  }
+
+  /** 在目标用户行打开行内编辑器(同一时刻仅一个)。 */
+  const openEditor = (row: HTMLElement, cp: RewindCandidate): void => {
+    closePopover()
+    closeEditor()
+    const sessionId = currentSessionId(sessions)
+    if (sessionId === undefined) return
+    // 原文优先取快照全文;读不到时退 pill 预览(截断)。
+    const original = messageTextAt(chatOf({ sessionId }), cp.seq) ?? cp.preview
+
+    row.dataset.dshEditing = 'true'
+    editingRow = row
+
+    const editor = document.createElement('div')
+    editor.dataset.dshEditEditor = 'true'
+    editor.style.cssText = [
+      'display:flex', 'flex-direction:column', 'gap:8px', 'width:100%',
+      'padding:10px', 'border:1px solid var(--dsw-alias-border-l2,#e4e7ec)',
+      'border-radius:12px', 'background:var(--dsw-alias-bg-primary,#fff)',
+    ].join(';')
+
+    const textarea = document.createElement('textarea')
+    textarea.value = original
+    textarea.setAttribute('aria-label', '编辑用户提示词')
+    // 字号对齐 composer（基础 UI 字号 + 内容字号增量），不要继承转录区的
+    // 内容字号（更大）；高度封顶 + 内滚——长文在编辑器内滚动，不把行撑出
+    // 可视区导致外层无法滚动查看。
+    const MAX_EDITOR_HEIGHT = 320
+    textarea.style.cssText = [
+      'box-sizing:border-box', 'width:100%', 'min-height:64px', `max-height:${MAX_EDITOR_HEIGHT}px`,
+      'resize:none', 'border:none', 'outline:none', 'overflow-y:auto',
+      'background:transparent', 'color:var(--dsw-alias-label-primary,#101828)',
+      'font-family:inherit',
+      'font-size:calc(14px + var(--dsh-content-font-delta, 0px))',
+      'line-height:20px', 'white-space:pre-wrap',
+    ].join(';')
+    const autoSize = (): void => {
+      textarea.style.height = 'auto'
+      textarea.style.height = `${Math.min(textarea.scrollHeight, MAX_EDITOR_HEIGHT)}px`
+    }
+    textarea.addEventListener('input', autoSize)
+
+    const actions = document.createElement('div')
+    actions.style.cssText = 'display:flex;justify-content:flex-end;gap:8px'.split(';').join(';')
+
+    const hint = document.createElement('span')
+    hint.style.cssText = 'font-size:12px;color:var(--dsw-alias-label-tertiary,#667085);align-self:center;margin-right:auto'
+
+    const cancel = document.createElement('button')
+    cancel.type = 'button'
+    cancel.textContent = '取消'
+    cancel.style.cssText = [
+      'padding:5px 12px', 'border:none', 'border-radius:8px', 'cursor:pointer',
+      'background:transparent', 'color:var(--dsw-alias-label-secondary,#475467)', 'font-size:13px',
+    ].join(';')
+    cancel.addEventListener('click', closeEditor)
+
+    const confirm = document.createElement('button')
+    confirm.type = 'button'
+    confirm.textContent = '确定'
+    confirm.style.cssText = [
+      'padding:5px 12px', 'border:none', 'border-radius:8px', 'cursor:pointer',
+      'background:var(--dsw-alias-button-primary-fill,#13715b)',
+      'color:var(--dsw-alias-label-primary-foreground,#fff)', 'font-size:13px',
+    ].join(';')
+
+    const runConfirm = (): void => {
+      const text = textarea.value
+      if (text.trim() === '') {
+        // 空文本无法作为提示词发送,视为放弃编辑。
+        closeEditor()
+        return
+      }
+      confirm.disabled = true
+      confirm.textContent = '正在回退…'
+      hint.textContent = ''
+      void (async () => {
+        // 确认时才回退:撤回该消息及其后,回填改后文本并自动发送。
+        const ok = await rewindAndRefillSession(sessionId, cp.seq, 'chat', undefined, text)
+        if (ok) {
+          closeEditor()
+          submitComposer()
+        } else {
+          confirm.disabled = false
+          confirm.textContent = '确定'
+          hint.textContent = '回退失败，请重试'
+        }
+      })().catch(() => {
+        confirm.disabled = false
+        confirm.textContent = '确定'
+        hint.textContent = '回退失败，请重试'
+      })
+    }
+    confirm.addEventListener('click', runConfirm)
+
+    textarea.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        event.stopPropagation()
+        closeEditor()
+        return
+      }
+      // Enter 换行(提示词常多行);Cmd/Ctrl+Enter 确认。
+      if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+        event.preventDefault()
+        event.stopPropagation()
+        runConfirm()
+      }
+    })
+
+    actions.append(hint, cancel, confirm)
+    editor.append(textarea, actions)
+    row.prepend(editor)
+    autoSize()
+    textarea.focus()
+    // 消息原本很高时，编辑器可能落在视口外：滚到可见。
+    editor.scrollIntoView({ block: 'nearest' })
+  }
+
+  // 浮层关闭后把键盘还给当前会话的 composer（只聚焦，绝不写草稿）。
+  registerComposerFocuser((sessionId) => {
+    try {
+      const conversation = getConversation() as {
+        input?: { for(actx: unknown): { focus?(): void } }
+      } | undefined
+      const scope = sessions.scope?.(sessionId)
+      const facade = conversation?.input !== undefined && scope !== undefined
+        ? conversation.input.for(scope)
+        : undefined
+      facade?.focus?.()
+    } catch {
+      // 聚焦兜底失败无妨。
+    }
+    document.querySelector<HTMLElement>('[data-composer-input]')?.focus()
+  })
+
+  /**
+   * 执行回退并回填：引擎通道发命令 → 等 marker-carrying 成功结局 → 把目标
+   * 消息文本回填 composer。浮层已自行关闭；这里的失败只进控制台。
+   */
+  /**
+   * 就地回退并回填（浮层确认后的执行体）：引擎命令 → 等 marker 结局 → 把
+   * 目标消息文本回填 composer。返回是否成功回填。
+   */
+  const rewindAndRefillSession = async (sessionId: string, seq: number, mode: 'chat' | 'both', planId?: string, textOverride?: string): Promise<boolean> => {
+    const binding = sessions.binding(sessionId)
+    if (binding === undefined) return false
+    const engineFace = { sessionId, command: (line: string) => binding.session.command(line) }
+    // 排除已存在的执行节点：重复回退同一消息必须等本次命令的节点。
+    const known = knownCommandSeqs(engineFace, chatOf, node => isExecutedRewindCommand(node, seq))
+    let result: Awaited<ReturnType<SessionFace['command']>>
+    try {
+      const line = mode === 'both' && planId !== undefined
+        ? `/${ENGINE_COMMAND} @${seq} both ${planId}`
+        : `/${ENGINE_COMMAND} @${seq} ${mode}`
+      result = await binding.session.command(line)
+    } catch (error) {
+      console.warn('[dsh-session-manager] 回退命令抛错，跳过回填', error)
+      return false
+    }
+    if (!result.ok) {
+      console.warn('[dsh-session-manager] 回退命令被拒绝', result.error)
+      return false
+    }
+    if (result.value?.matched !== true) {
+      console.warn('[dsh-session-manager] 回退命令未匹配（宿主可能未注册）')
+      return false
+    }
+    // 执行回退会先停运行中的回合，等待窗口比 preview 长。
+    let outcome: Awaited<ReturnType<typeof waitForCommand>>
+    try {
+      outcome = await waitForCommand(
+        engineFace,
+        chatOf,
+        node => isExecutedRewindCommand(node, seq) && !known.has(node.seq),
+        20_000,
+        cb => watchChat(sessionId, cb),
+      )
+    } catch (error) {
+      console.warn('[dsh-session-manager] 等待回退结局抛错', error)
+      return false
+    }
+    if (outcome === null) {
+      console.warn('[dsh-session-manager] 回退在超时内未落定，跳过回填')
+      return false
+    }
+    if (outcome.kind !== 'success') {
+      // 宿主拒绝（如目标已被压缩遮蔽）：原因进控制台，不打断用户。
+      console.warn('[dsh-session-manager] 回退被拒绝：', outcome.text)
+      throw new Error(outcome.text ?? '回退被拒绝')
+    }
+    // 用户可能在回退期间切换会话：只回填回退发生的会话。
+    if (currentSessionId(sessions) !== sessionId) return false
+    // 编辑确认后回填改后文本;常规回退回填原文。
+    const text = textOverride ?? messageTextAt(chatOf({ sessionId }), seq)
+    if (text === undefined) return false
+    return writeComposer(sessionId, text)
+  }
+
+  const runRewindAndFill = async (sessionId: string, seq: number, mode: 'chat' | 'both', planId?: string): Promise<void> => {
+    try {
+      await rewindAndRefillSession(sessionId, seq, mode, planId)
+    } catch {
+      // 浮层路径的失败已进控制台;这里不再上抛。
+    }
+  }
+
+  /**
+   * 就地重发（刷新/重新生成的新实现）：回退到目标消息 → 文本回填 →
+   * 自动 Enter 重发。不再 fork：会话 id 不变、无切换/归档/模型同步。
+   */
+  const regenerateInPlace = async (sessionId: string, seq: number): Promise<void> => {
+    if (await rewindAndRefillSession(sessionId, seq, 'chat')) {
+      submitComposer()
+    }
+  }
+  regenerateHook = regenerateInPlace
+
+  /** pointerdown 预取（RPC）：浮层打开时直接以落定态渲染，消除「检查中」闪烁。 */
+  const prewarmRewind = (seq: number): void => {
+    const sessionId = currentSessionId(sessions)
+    if (sessionId === undefined) return
+    prewarmPreview(sessionId, seq)
+  }
+
+  /** 点击按钮：打开模式浮层（影响清单经 RPC，执行经引擎命令通道）。 */
+  const openRewindPopover = (cp: RewindCandidate, anchor: HTMLElement): void => {
+    const sessionId = currentSessionId(sessions)
+    if (sessionId === undefined) return
+    openPopover({
+      sessionId,
+      seq: cp.seq,
+      preview: cp.preview,
+      anchor,
+      onRewind: (mode, planId) => {
+        void runRewindAndFill(sessionId, cp.seq, mode, planId)
+      },
+    })
+  }
+
   const sync = () => {
     if (disposed || syncing) return
     syncing = true
     try {
       const current = currentSessionSnapshot(sessions, getUiConversation)
-      const checkpoints = computeUserCheckpoints(current?.chat)
-      const byKey = new Map(checkpoints.map((cp) => [cp.key, cp]))
-      const refreshTargets = computeUserRefreshTargets(current?.chat)
+      const chat = current?.chat
+      const nodesByKey = nodeKeyIndex(chat)
+      const candidates = computeRewindCandidates(chat)
+      const byKey = new Map(candidates.map((cp) => [cp.key, cp]))
+      const refreshTargets = computeUserRefreshTargets(chat)
       latestRefreshTargets = refreshTargets
+
+      // 被撤回的行隐藏（hiddenSeqsOf：区间合并 + 命令探测节点）。
+      const hiddenChat = hiddenChatOf(chat)
+      const hiddenSeqs = hiddenChat === undefined ? undefined : hiddenSeqsOf(hiddenChat)
+      if (hiddenSeqs !== undefined) {
+        const setHidden = (row: HTMLElement, hide: boolean): void => {
+          if (hide && row.dataset.dshRewindHidden !== 'true') {
+            row.style.display = 'none'
+            row.dataset.dshRewindHidden = 'true'
+          } else if (!hide && row.dataset.dshRewindHidden === 'true') {
+            row.style.display = ''
+            delete row.dataset.dshRewindHidden
+          }
+        }
+        for (const row of Array.from(document.querySelectorAll<HTMLElement>('[data-chat-anchor-key], [data-chat-node-key], [data-chat-flow-key]'))) {
+          const node = resolveSeatNode(row, nodesByKey)
+          const anchorSeq = typeof node?.anchorSeq === 'number'
+            ? node.anchorSeq
+            : (typeof node?.data?.seq === 'number' ? node.data.seq : undefined)
+          setHidden(row, typeof anchorSeq === 'number' && hiddenSeqs.has(anchorSeq))
+        }
+        // 分组外壳（group: 锚点）解析不到 chat 节点——纯视图构造：成员行
+        // 全部被撤才隐藏外壳，绝不明撤半空的组（对齐 dsh-rewind）。
+        for (const shell of Array.from(document.querySelectorAll<HTMLElement>('[data-chat-anchor-key^="group:"]'))) {
+          const members = Array.from(shell.querySelectorAll<HTMLElement>('[data-chat-anchor-key], [data-chat-node-key], [data-chat-flow-key]'))
+          if (members.length === 0) continue
+          setHidden(shell, members.every(member => member.dataset.dshRewindHidden === 'true'))
+        }
+      }
 
       // 索引现有 pill（按 key 去重），重复或缺 key 的直接移除
       const pillByKey = new Map<string, HTMLElement>()
@@ -1101,28 +1221,61 @@ function installCheckpointEntries(
 
       const seen = new Set<string>()
       const seenRefresh = new Set<string>()
-      const rows = Array.from(document.querySelectorAll<HTMLElement>('[data-chat-flow-kind="user"]'))
+      // 0.2.1 的行身份是 anchor-key/node-key（见 resolveSeatNode）；
+      // 候选按 node.key 匹配（computeRewindCandidates 的 key 即 node.key）。
+      const rows = Array.from(document.querySelectorAll<HTMLElement>(
+        '[data-chat-flow-kind="user"], [data-chat-flow-kind="steering"]',
+      ))
       let rowsWithActions = 0
       let copyTemplates = 0
       for (const row of rows) {
-        const key = row.getAttribute('data-chat-flow-key') ?? ''
-        seen.add(key)
-        const cp = key ? byKey.get(key) : undefined
+        const node = resolveSeatNode(row, nodesByKey)
+        const key = typeof node?.key === 'string' ? node.key : ''
+        const cp = key === '' ? undefined : byKey.get(key)
 
-        let pill = key ? pillByKey.get(key) : undefined
-        if (!cp) {
+        let pill = key === '' ? undefined : pillByKey.get(key)
+        if (!cp || row.dataset.dshRewindHidden === 'true') {
+          // 无候选或已被回退撤回：不留按钮。
           pill?.remove()
+          if (cp === undefined) continue
+          // 行被隐藏但仍有候选：刷新按钮也不留。
+          const actions = actionsContainerOf(row)
+          actions?.querySelector<HTMLElement>('[data-dsh-refresh="true"]')?.remove()
           continue
         }
-        if (!pill) {
-          pill = createCheckpointPill(cp, key, () => openRollbackDialog(cp, sessions, workspaces))
+        seen.add(key)
+        if (pill === undefined) {
+          pill = createRewindPill(
+            cp,
+            key,
+            () => {
+              const button = pill!.querySelector('button')
+              if (button !== null) openRewindPopover(cp, button)
+            },
+            () => prewarmRewind(cp.seq),
+            () => {
+              // 编辑：消息原位变输入框，确定时才回退并发送改后文本。
+              openEditor(row, cp)
+            },
+          )
           pillByKey.set(key, pill)
         }
-        const actions = findActionsRow(row)
+        const actions = actionsContainerOf(row)
         if (actions) {
           // 复制按钮的 actions 行作为唯一宿主；复制其真实 class/style，确保两者视觉一致。
           if (!actions.contains(pill)) actions.appendChild(pill)
-          adoptCopyButtonStyle(pill, actions, cp, () => openRollbackDialog(cp, sessions, workspaces))
+          // 注意：adopt 会把按钮 replaceWith 成克隆节点，锚点必须点击时实时取，
+          // 闭包捕获旧引用会拿到已脱离 DOM 的节点（rect 全零 → 弹层飞左上角）。
+          adoptCopyButtonStyle(
+            pill,
+            actions,
+            cp,
+            () => {
+              const liveButton = pill.querySelector('button')
+              if (liveButton !== null) openRewindPopover(cp, liveButton)
+            },
+            () => prewarmRewind(cp.seq),
+          )
           rowsWithActions += 1
           if (actions.querySelector('button[aria-label="复制"], button[aria-label="copy"]')) copyTemplates += 1
         } else if (row.nextElementSibling !== pill) {
@@ -1130,8 +1283,8 @@ function installCheckpointEntries(
           row.insertAdjacentElement('afterend', pill)
         }
 
-        // 刷新按钮：固定在 actions 行第一位（复制/回滚之前）。
-        const refreshTarget = key ? refreshTargets.get(key) : undefined
+        // 刷新按钮：固定在 actions 行第一位（复制/回退之前）。
+        const refreshTarget = key === '' ? undefined : refreshTargets.get(key)
         if (actions) {
           const refreshButton = actions.querySelector<HTMLElement>('[data-dsh-refresh="true"]')
           if (refreshTarget && !refreshTarget.generating) {
@@ -1144,9 +1297,14 @@ function installCheckpointEntries(
 
         const button = pill.querySelector('button')
         if (button) {
-          // 常驻 actions 按钮不清空文本；未找到复制模板时仍显示清晰的回滚入口。
-          if (button.dataset.dshCopyStyle !== 'true') button.textContent = `↩ 回滚 #${cp.turn}`
-          button.title = cp.preview ? `回滚到第 ${cp.turn} 轮之前：${cp.preview}` : `回滚到第 ${cp.turn} 轮之前`
+          // 图标常驻：无 SVG 时补上（React 重建行后 pill 重挂的场景）。
+          if (button.querySelector('svg') === null) button.replaceChildren(rewindIcon())
+          button.title = cp.preview ? `回退到这条消息：${cp.preview}` : '回退到这条消息'
+        }
+        const editButton = pill.querySelector<HTMLButtonElement>('[data-dsh-edit-button="true"]')
+        if (editButton !== null) {
+          if (editButton.querySelector('svg') === null) editButton.replaceChildren(editIcon())
+          editButton.title = cp.preview ? `编辑这条消息并重发：${cp.preview}` : '编辑这条消息并重发'
         }
       }
 
@@ -1161,16 +1319,19 @@ function installCheckpointEntries(
       if (debugEnabled()) {
         const signature = JSON.stringify({
           sessionId: current?.sessionId,
-          hasChat: Boolean(current?.chat),
+          hasChat: Boolean(chat),
+          hasOrder: Array.isArray(chat?.order),
           rows: rows.length,
-          checkpoints: checkpoints.length,
+          resolved: rows.filter((row) => resolveSeatNode(row, nodesByKey) !== undefined).length,
+          candidates: candidates.length,
+          hidden: hiddenSeqs?.size ?? 0,
           rowsWithActions,
           copyTemplates,
           pills: document.querySelectorAll(CHECKPOINT_PILL).length,
         })
         if (signature !== lastDebugSignature) {
           lastDebugSignature = signature
-          console.debug('[dsh-session-manager] rollback sync:', signature)
+          console.debug('[dsh-session-manager] rewind sync:', signature)
         }
       }
     } finally {
@@ -1178,26 +1339,56 @@ function installCheckpointEntries(
     }
   }
 
+  // 这些子树的变更不可能改变回退的目标集合（对齐 dsh-rewind 的
+  // IGNORED_PORTAL_SCOPE）：composer、右侧栏、插件页。忽略它们避免每次
+  // 击键都排一轮全转录扫描。
+  const IGNORED_SCOPE = [
+    '[data-composer-seat]',
+    '[data-composer-input]',
+    '[data-sidebar-right-panel]',
+    '[data-sidebar-chat]',
+    '[data-plugin-panel]',
+  ].join(', ')
+
+  // 微任务合批（对齐 dsh-rewind 的刷新机制）：preview 命令行插入后必须在
+  // 绘制之前隐藏——setTimeout 是宏任务、跑在 paint 之后，会产生一帧可见的
+  // 布局弹跳（transcript 先长高 24px 顶动滚动、再隐藏弹回）。
+  let scheduled = false
   const schedule = () => {
-    if (disposed || syncing || timer !== undefined) return
-    timer = setTimeout(() => {
-      timer = undefined
+    if (disposed || syncing || scheduled) return
+    scheduled = true
+    queueMicrotask(() => {
+      scheduled = false
       if (!disposed) sync()
-    }, 50)
+    })
+  }
+
+  const onMutations = (mutations: MutationRecord[]): void => {
+    // 全部落在忽略域内的变更直接跳过。
+    if (mutations.length > 0) {
+      let ignored = 0
+      for (const mutation of mutations) {
+        const target = mutation.target
+        if (target instanceof Element && target.closest(IGNORED_SCOPE) !== null) ignored += 1
+      }
+      if (ignored === mutations.length) return
+    }
+    schedule()
   }
 
   const unsubscribe = sessions.list.subscribe?.(schedule)
-  const observer = new MutationObserver(schedule)
+  const observer = new MutationObserver(onMutations)
   observer.observe(document.body, { childList: true, subtree: true })
   schedule()
 
   return () => {
     disposed = true
-    if (timer !== undefined) clearTimeout(timer)
     observer.disconnect()
     unsubscribe?.()
+    closePopover()
+    closeEditor()
+    registerPreviewCall(null)
     removeAllCheckpointPills()
-    document.querySelector(CHECKPOINT_DIALOG)?.remove()
     document.querySelectorAll('[data-dsh-refresh="true"]').forEach((element) => element.remove())
   }
 }
@@ -1352,218 +1543,14 @@ function createSvgElement(name: string, attributes: Record<string, string>): SVG
 // ═══════════════════════════════════════════════════════════
 
 /** 重新生成的模块级幂等锁：跨组件实例/重挂载生效。key = `${sessionId}:${sourceKey}`。 */
-const activeRegenerations = new Set<string>()
-/** 等待新回复的硬上限（足够覆盖长答案；显式取消走 AbortController）。 */
-const REGENERATE_TIMEOUT_MS = 10 * 60 * 1000
 
-interface RegenerateRequest {
-  sessionId: string
-  /** 幂等键：助手消息用 messageId，用户消息用 user node key。 */
-  sourceKey: string
-  content: unknown[]
-  /** fork 边界：上一轮 turn/end seq；第一轮为 undefined（改用 atSeq=0 fork）。 */
-  previousTurnEnd: number | undefined
-  turn: number | undefined
-}
-
-interface RegenerateDeps {
-  sessions: DshSessions
-  workspaces: DshWorkspaces
-  getUiConversation?: Resolver<DshUiConversation>
-  signal?: AbortSignal
-}
-
-/** 读取某会话的 chat 视图快照。 */
-function readChatView(getUiConversation: Resolver<DshUiConversation>, sessionId: string): ChatSnapshotView | undefined {
-  try {
-    return getUiConversation()?.binding(sessionId)?.snapshot?.getSnapshot()?.views?.get('chat')
-  } catch {
-    return undefined
-  }
-}
-
-/** 提交 prompt 前，收集重建会话里已有 assistant 的 messageId 基线。 */
-function collectBaselineAssistantIds(getUiConversation: Resolver<DshUiConversation>, sessionId: string): Set<string> {
-  const ids = new Set<string>()
-  const chat = readChatView(getUiConversation, sessionId)
-  for (const node of chat?.nodes?.values() ?? []) {
-    if (!isAssistantNode(node)) continue
-    const id = assistantMessageId(node)
-    if (id !== undefined) ids.add(id)
-  }
-  return ids
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-/**
- * 等待"本次新生成"的 assistant 进入终态：仅 `status === 'settled'` 算成功，
- * `status === 'interrupted'` 算失败/被中断。基线之外的 assistant（含 streaming 中
- * 尚未拿到 messageId 的节点）一律视为"新回复"，不再拿历史回复顶包。
- */
-async function waitForNewAssistant(
-  getUiConversation: Resolver<DshUiConversation>,
-  sessionId: string,
-  baselineIds: Set<string>,
-  signal: AbortSignal | undefined,
-  timeoutMs: number = REGENERATE_TIMEOUT_MS,
-): Promise<void> {
-  const scanFresh = (): ChatViewNode | undefined => {
-    const chat = readChatView(getUiConversation, sessionId)
-    const fresh: ChatViewNode[] = []
-    for (const node of chat?.nodes?.values() ?? []) {
-      if (!isAssistantNode(node)) continue
-      const id = assistantMessageId(node)
-      if (id === undefined || !baselineIds.has(id)) fresh.push(node)
-    }
-    return fresh.at(-1)
-  }
-
-  const deadline = Date.now() + timeoutMs
-  for (;;) {
-    if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error('已取消')
-    const target = scanFresh()
-    if (target) {
-      const status = (target.data as { status?: unknown } | null | undefined)?.status
-      if (status === 'settled') return
-      if (status === 'interrupted') throw new Error('重新生成已被中断')
-    }
-    if (Date.now() >= deadline) throw new Error('等待新回复超时')
-    await sleep(150)
-  }
-}
-
-/** 会话的模型选择（session/selectModel 的投影与 RPC 载荷形状）。 */
-interface SessionModelSelection {
-  provider: string
-  model: string
-  reasoningEffort?: string
-}
-
-/** Session 对象上插件用到的内部面：projections（读当前模型投影）与 remote（selectModel RPC）。 */
-interface SessionInternals {
-  projections?: { faceOf?(key: string): { getSnapshot(): unknown } | undefined }
-  remote?: {
-    session?: {
-      selectModel?(request: {
-        sessionId: string
-        provider: string
-        model: string
-        reasoningEffort?: string
-      }): Promise<{ ok: boolean; error?: { message?: string } }>
-    }
-  }
-}
-
-/** 读源会话当前生效的模型选择（投影 view 的 next = pending ?? lastUsed）。 */
-function readModelSelection(sessions: DshSessions, sessionId: string): SessionModelSelection | undefined {
-  try {
-    const face = sessions.binding(sessionId)?.session as (SessionFace & SessionInternals) | undefined
-    const snapshot = face?.projections?.faceOf?.('modelSelection')?.getSnapshot() as
-      | { next?: SessionModelSelection | null }
-      | undefined
-    const next = snapshot?.next
-    if (next && typeof next.provider === 'string' && typeof next.model === 'string') {
-      return {
-        provider: next.provider,
-        model: next.model,
-        ...(typeof next.reasoningEffort === 'string' ? { reasoningEffort: next.reasoningEffort } : {}),
-      }
-    }
-  } catch {
-    // 投影缺失（未运行过/旧宿主）按“无选择”处理，fork 继承默认行为。
-  }
-  return undefined
-}
-
-/** 把选择补设到重建出的会话（selectForNextRequest 生效于下一次请求）；失败不阻塞重新生成。 */
-async function restoreModelSelection(
-  sessions: DshSessions,
-  sessionId: string,
-  selection: SessionModelSelection,
-): Promise<void> {
-  try {
-    const face = sessions.binding(sessionId)?.session as (SessionFace & SessionInternals) | undefined
-    const result = await face?.remote?.session?.selectModel?.({
-      sessionId,
-      provider: selection.provider,
-      model: selection.model,
-      ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
-    })
-    if (result && result.ok === false) {
-      console.warn(`[dsh-session-manager] 恢复模型选择失败：${result.error?.message ?? 'unknown'}`)
-    }
-  } catch (error) {
-    console.warn('[dsh-session-manager] 恢复模型选择失败：', error)
-  }
-}
-
-/** 第一轮也尽量 fork（atSeq=0 截取到仅 header，继承配置）；失败才退化为 connectWorkspace。 */
-async function forkFirstTurn(deps: RegenerateDeps, req: RegenerateRequest): Promise<string> {
-  try {
-    return await deps.sessions.fork({ sessionId: req.sessionId, atSeq: 0, increaseTitle: false })
-  } catch {
-    const workspaceId = findWorkspaceId(req.sessionId, deps.sessions, deps.workspaces)
-    if (!workspaceId) throw new Error('无法确定该会话所属工作区')
-    return await deps.workspaces.connectWorkspace(workspaceId)
-  }
-}
-
-/** 刷新/重新生成主流程：fork → prompt（宿主接纳即返回）→ 返回新会话 id。
- *  答案随后在新会话里流式生成；由调用方立刻 switch + 归档原会话，做到「原地替换」
- *  的手感：fork 已完整保留原历史，旧会话只是归档隐藏、可恢复。 */
-async function regenerateTurn(req: RegenerateRequest, deps: RegenerateDeps): Promise<string> {
-  const lockKey = `${req.sessionId}:${req.sourceKey}`
-  if (activeRegenerations.has(lockKey)) throw new Error('正在重新生成，请稍候')
-  activeRegenerations.add(lockKey)
-
-  const controller = new AbortController()
-  const onExternalAbort = (): void => controller.abort()
-  deps.signal?.addEventListener('abort', onExternalAbort, { once: true })
-  const timeout = setTimeout(() => controller.abort(new Error('重新生成超时')), REGENERATE_TIMEOUT_MS)
-
-  let replacementSessionId: string | undefined
-  try {
-    replacementSessionId =
-      req.previousTurnEnd !== undefined
-        ? await deps.sessions.fork({ sessionId: req.sessionId, atSeq: req.previousTurnEnd, increaseTitle: false })
-        : await forkFirstTurn(deps, req)
-
-    const replacement = deps.sessions.binding(replacementSessionId)
-    if (!replacement) throw new Error('重建会话失败')
-
-    // fork 截断在旧边界，边界之后「切换模型」的 model/selection 事件不会被子会话继承，
-    // 投影会回退到旧模型。这里把源会话当前的模型选择补设到新会话，再提交 prompt。
-    const selection = readModelSelection(deps.sessions, req.sessionId)
-    if (selection) await restoreModelSelection(deps.sessions, replacementSessionId, selection)
-
-    // prompt('queue') 在宿主接纳后立刻返回；此后调用方尽快切走并归档原会话，
-    // 不滞留等待——滞留期是「fork 残留多条会话」的根源。
-    await replacement.session.prompt(req.content, 'queue', controller.signal)
-    return replacementSessionId
-  } catch (error) {
-    // 失败：原会话保持可用；清理被放弃的重建分支，避免残留空会话。
-    if (replacementSessionId !== undefined) {
-      try {
-        await deps.workspaces.archiveSession(replacementSessionId)
-      } catch {
-        // 清理失败不覆盖原始错误。
-      }
-    }
-    throw error
-  } finally {
-    clearTimeout(timeout)
-    deps.signal?.removeEventListener('abort', onExternalAbort)
-    activeRegenerations.delete(lockKey)
-  }
-}
 
 const subscribeNoop = (): (() => void) => () => undefined
 
 interface RetryContext {
   content: unknown[]
+  /** 所属用户消息的 user/message 事件 seq（就地回退的 @seq）。 */
+  userSeq: number | undefined
   previousTurnEnd: number | undefined
   turn: number | undefined
   assistantStatus: string | undefined
@@ -1609,8 +1596,10 @@ function computeRetryContext(chat: ChatSnapshotView | undefined, messageId: stri
   }
 
   const assistantStatus = (assistant.data as { status?: unknown } | null | undefined)?.status
+  const userSeq = typeof user?.anchorSeq === 'number' ? user.anchorSeq : user?.data?.seq
   return {
     content: [...content],
+    userSeq,
     previousTurnEnd,
     turn: typeof turn === 'number' ? turn : undefined,
     assistantStatus: typeof assistantStatus === 'string' ? assistantStatus : undefined,
@@ -1622,13 +1611,11 @@ function RetryButton({
   sessionId,
   messageId,
   sessions,
-  workspaces,
   getUiConversation,
 }: {
   sessionId: string
   messageId: string
   sessions: DshSessions
-  workspaces: DshWorkspaces
   getUiConversation: Resolver<DshUiConversation>
 }) {
   const [busy, setBusy] = React.useState(false)
@@ -1669,20 +1656,14 @@ function RetryButton({
       retryContext.assistantKey ? [retryContext.assistantKey] : [],
       retryContext.turn,
     )
+    if (retryContext.userSeq === undefined) {
+      setError('定位不到所属用户消息')
+      return
+    }
     try {
-      const replacementSessionId = await regenerateTurn(
-        {
-          sessionId,
-          sourceKey: messageId,
-          content: retryContext.content,
-          previousTurnEnd: retryContext.previousTurnEnd,
-          turn: retryContext.turn,
-        },
-        { sessions, workspaces, getUiConversation, signal: controller.signal },
-      )
-      // 替换原回答：先切到新会话，再归档原会话。
-      if (sessions.list.getSnapshot().current === sessionId) sessions.open(replacementSessionId)
-      await archiveQuietly(workspaces, sessionId)
+      // 就地重发：回退到该回合的用户消息并自动重发——会话不变，无切换/归档。
+      await (regenerateHook?.(sessionId, retryContext.userSeq)
+        ?? Promise.reject(new Error('回退管线未就绪')))
     } catch (cause) {
       setError(toErrorMessage(cause))
     } finally {
@@ -1780,5 +1761,5 @@ function toErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-// 纯逻辑导出：供测试验证同回合定位、基线过滤与终态等待，不影响运行时注入。
-export { assistantMessageId, collectBaselineAssistantIds, computeRetryContext, computeUserRefreshTargets, waitForNewAssistant }
+// 纯逻辑导出：供测试验证同回合定位与刷新目标计算，不影响运行时注入。
+export { assistantMessageId, computeRetryContext, computeUserRefreshTargets }
