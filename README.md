@@ -117,6 +117,16 @@ dsh --profile web
 
 插件包通过 `package.json` 的 `exports["./client"]` 和 `dsh.client` 配置加载 Client bundle；Host 入口注册 `/rewind`、`/undo`、内部引擎通道与 `/snapshot-auto-cleanup` 命令，并维护写前备份检查点存储（`src/snapshot.ts`，完整移植自 dsh-rewind，含崩溃恢复 journal）；Client 侧 ↶ 按钮沿用本仓的 DOM 注入骨架，浮层/隐藏行/输入框回填移植自 dsh-rewind（`src/client/popover.ts`、`src/client/hidden.ts`）。
 
+## 致谢
+
+本插件的回退能力大量参考并移植自 [SiriLee/dsh-rewind](https://github.com/SiriLee/dsh-rewind)(MIT License),包括:
+
+- **回退机制**:就地 append-only 表面遮蔽(`surfaceOp: replace` 标记)、纯规划层(`src/rewind.ts`/`src/marker.ts`)与候选计算;
+- **文件检查点存储**:`src/snapshot.ts` 完整移植——写前备份、dedup 链接、journaled restore(崩溃恢复)、prune 与版本 fail-closed,另含 `src/snapshot-cleanup.ts` 与对应的测试套件;
+- **Client 交互**:模式浮层(`src/client/popover.ts`)、被撤回行隐藏算法(`src/client/hidden.ts`)、↶/✎ 图标与浮层材质,以及影响预览走 Connection RPC 的读取方案(v0.18.0)。
+
+在本仓基础上的差异:预演计划带 sha256 基线与 planId 复核(预演→执行窗口内被外部改动的文件不覆盖)、行内编辑与刷新/重新生成复用同一回退管线、按钮挂载沿用本仓的 DOM 注入骨架(非 React portal)。
+
 ## 开发
 
 ```bash
