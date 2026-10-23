@@ -210,7 +210,7 @@ export function apply(ctx: ClientContext): void {
     }
 
     // DSH 当前没有"会话行菜单项"扩展 Slot。这里仅做菜单兼容层，
-    // 将"删除会话"插到内置"归档会话"之后，而不再占用会话详情头部。
+    // 将"删除会话"追加到会话菜单末尾（内置“复制 Session ID”之后），而不再占用会话详情头部。
     if (sessionDelete && disposeSessionMenu === undefined) {
       disposeSessionMenu = installSessionMenuDelete(workspaces, sessions, sessionDeleteEnabledNow)
     } else if (!sessionDelete && disposeSessionMenu !== undefined) {
@@ -1460,12 +1460,44 @@ function installSessionMenuDelete(
       const text = item.textContent?.trim().toLocaleLowerCase() ?? ''
       return text.includes('归档会话') || text.includes('archive session')
     })
-    if (!archiveItem || archiveItem.parentElement?.querySelector('[data-dsh-session-delete="true"]')) return
+    const menu = archiveItem?.closest<HTMLElement>('[role="menu"]') ?? null
+    if (!archiveItem || !menu) return
 
-    const deleteItem = archiveItem.cloneNode(true) as HTMLElement
-    deleteItem.setAttribute('data-dsh-session-delete', 'true')
+    // MenuItemButton 把每个按钮包在 itemWrap 里，真正的列表是 menu 内带
+    // role="presentation" 的视口容器（footer 在视口之外）。
+    const viewport = archiveItem.closest<HTMLElement>('[role="presentation"]')
+    const list = viewport !== null && menu.contains(viewport) ? viewport : menu
+
+    // 删除项固定在菜单最末位。内置项按 order 排序（“复制 Session ID”在“归档会话”
+    // 之后），其他插件也可能追加菜单项，所以每次同步都把已存在的删除项挪回末尾。
+    const existing = Array.from(list.children).find(
+      (child) => child instanceof HTMLElement && child.getAttribute('data-dsh-session-delete') === 'true',
+    ) as HTMLElement | undefined
+    if (existing) {
+      if (list.lastElementChild !== existing) list.append(existing)
+      return
+    }
+
+    // 菜单重挂后旧容器里的残留项先清掉，避免页面上同时出现多个“删除会话”。
+    document.querySelectorAll('[data-dsh-session-delete="true"]').forEach((element) => element.remove())
+
+    // 连同 itemWrap 一起克隆，保持与内置菜单项完全一致的布局结构；只在父节点
+    // 确实只包着这一个菜单项时这样做，避免误克隆整个列表容器。
+    const archiveWrapper = archiveItem.parentElement
+    const cloneWrapper = archiveWrapper !== null && archiveWrapper.querySelectorAll('[role="menuitem"]').length === 1
+    const deleteNode = (cloneWrapper ? archiveWrapper : archiveItem).cloneNode(true) as HTMLElement
+    const deleteItem = deleteNode.getAttribute('role') === 'menuitem'
+      ? deleteNode
+      : deleteNode.querySelector<HTMLElement>('[role="menuitem"]')
+    if (!deleteItem) return
+    deleteNode.setAttribute('data-dsh-session-delete', 'true')
     deleteItem.setAttribute('aria-label', '删除会话')
     deleteItem.removeAttribute('aria-current')
+    // 归档项的 ⌥⌘A 快捷键不属于删除，连同 aria-keyshortcuts 一起去掉，避免误导
+    deleteItem.removeAttribute('aria-keyshortcuts')
+    for (const key of deleteItem.querySelectorAll('kbd')) {
+      key.closest('span[aria-hidden="true"]')?.remove()
+    }
     replaceMenuLabel(deleteItem, '删除会话')
     replaceMenuIcon(deleteItem)
     deleteItem.style.color = 'var(--dsw-alias-state-error-primary, #d92d20)'
@@ -1483,7 +1515,7 @@ function installSessionMenuDelete(
       }
     }, true)
 
-    archiveItem.insertAdjacentElement('afterend', deleteItem)
+    list.append(deleteNode)
   }
 
   document.addEventListener('pointerdown', onDocumentPointerDown, true)
