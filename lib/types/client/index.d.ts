@@ -44,8 +44,49 @@ interface RemoteCommandResult {
         message?: string;
     };
 }
+interface SessionLogEvent {
+    type: string;
+    seq: number;
+    data: {
+        id?: string;
+        content?: readonly {
+            type?: string;
+            text?: string;
+        }[];
+        source?: {
+            kind?: string;
+            rpcId?: string;
+        };
+        turn?: number;
+        target?: string;
+        start?: number;
+        removedCount?: number;
+        outcome?: string;
+        inserted?: readonly {
+            id: string;
+            source?: {
+                rpcId?: string;
+            };
+        }[];
+        reason?: {
+            kind?: string;
+            error?: {
+                message?: string;
+            };
+        };
+    };
+}
+interface ModelDirectoryFace {
+    load(): Promise<{
+        routable: boolean | null;
+        current: {
+            model: string;
+        } | null;
+        error: string | null;
+    }>;
+}
 interface SessionFace {
-    prompt(parts: unknown[], mode: 'queue' | 'steer', signal?: AbortSignal): Promise<unknown>;
+    prompt(parts: unknown[], mode: 'queue' | 'steer', signal?: AbortSignal, requestId?: string): Promise<RemoteCommandResult>;
     /** 执行一条斜杠命令（纯接纳语义；结局以 chat 视图的 CommandNode 落定）。 */
     command(line: string): Promise<RemoteCommandResult>;
 }
@@ -53,6 +94,12 @@ interface DshSessions {
     readonly list: ObservableSnapshot<SessionListState>;
     binding(id: string): {
         session: SessionFace;
+        eventSource: ObservableSnapshot<{
+            entries: readonly {
+                type: string;
+                event: SessionLogEvent;
+            }[];
+        }>;
     } | undefined;
     fork(opts: {
         sessionId: string;
@@ -137,6 +184,9 @@ interface ClientContext {
     get(name: 'uiConversation'): DshUiConversation | undefined;
     get(name: 'connection'): unknown;
     get(name: 'conversation'): unknown;
+    get(name: 'modelDirectories'): {
+        directoryFor(sessionId: string): ModelDirectoryFace;
+    } | undefined;
     on?: (name: 'dispose', callback: () => void) => void;
 }
 export declare function apply(ctx: ClientContext): void;
