@@ -77,15 +77,46 @@ interface RemoteCommandResult {
   error?: { code?: string; message?: string }
 }
 
+interface SessionLogEvent {
+  type: string
+  seq: number
+  data: {
+    id?: string
+    content?: readonly { type?: string; text?: string }[]
+    source?: { kind?: string; rpcId?: string }
+    turn?: number
+    target?: string
+    start?: number
+    removedCount?: number
+    outcome?: string
+    inserted?: readonly { id: string; source?: { rpcId?: string } }[]
+    reason?: { kind?: string; error?: { message?: string } }
+  }
+}
+
+interface ComposerFace {
+  setDraft(text: string): void
+  focus?(): void
+  notify(level: 'info' | 'error', text: string): void
+  state: ObservableSnapshot<{ draft: string; draftRev: number; attachmentIds: readonly unknown[] }>
+}
+
+interface ModelDirectoryFace {
+  load(): Promise<{ routable: boolean | null; current: { model: string } | null; error: string | null }>
+}
+
 interface SessionFace {
-  prompt(parts: unknown[], mode: 'queue' | 'steer', signal?: AbortSignal): Promise<unknown>
+  prompt(parts: unknown[], mode: 'queue' | 'steer', signal?: AbortSignal, requestId?: string): Promise<RemoteCommandResult>
   /** 执行一条斜杠命令（纯接纳语义；结局以 chat 视图的 CommandNode 落定）。 */
   command(line: string): Promise<RemoteCommandResult>
 }
 
 interface DshSessions {
   readonly list: ObservableSnapshot<SessionListState>
-  binding(id: string): { session: SessionFace } | undefined
+  binding(id: string): {
+    session: SessionFace
+    eventSource: ObservableSnapshot<{ entries: readonly { type: string; event: SessionLogEvent }[] }>
+  } | undefined
   fork(opts: { sessionId: string; atSeq?: number; increaseTitle?: boolean }): Promise<string>
   open(id: string): void
   /** 会话输入 shell 的作用域键（composer draft 写入需要）。 */
@@ -163,6 +194,7 @@ interface ClientContext {
   get(name: 'uiConversation'): DshUiConversation | undefined
   get(name: 'connection'): unknown
   get(name: 'conversation'): unknown
+  get(name: 'modelDirectories'): { directoryFor(sessionId: string): ModelDirectoryFace } | undefined
   on?: (name: 'dispose', callback: () => void) => void
 }
 
@@ -210,7 +242,7 @@ export function apply(ctx: ClientContext): void {
     }
 
     // DSH 当前没有"会话行菜单项"扩展 Slot。这里仅做菜单兼容层，
-    // 将"删除会话"插到内置"归档会话"之后，而不再占用会话详情头部。
+    // 将"删除会话"追加到会话菜单末尾（内置“复制 Session ID”之后），而不再占用会话详情头部。
     if (sessionDelete && disposeSessionMenu === undefined) {
       disposeSessionMenu = installSessionMenuDelete(workspaces, sessions, sessionDeleteEnabledNow)
     } else if (!sessionDelete && disposeSessionMenu !== undefined) {
@@ -270,7 +302,9 @@ export function apply(ctx: ClientContext): void {
       return undefined
     }
   }
-  const disposeRewind = installRewindEntries(sessions, getUiConversation, getConversation, getConnection)
+  const getModelDirectory = (sessionId: string): ModelDirectoryFace | undefined =>
+    ctx.get('modelDirectories')?.directoryFor(sessionId)
+  const disposeRewind = installRewindEntries(sessions, getUiConversation, getConversation, getConnection, getModelDirectory)
   ctx.on?.('dispose', disposeRewind)
   ctx.on?.('dispose', () => closePopover())
 
@@ -782,6 +816,7 @@ function installRewindEntries(
   getUiConversation: Resolver<DshUiConversation>,
   getConversation: () => unknown,
   getConnection: Resolver<unknown>,
+  getModelDirectory: (sessionId: string) => ModelDirectoryFace | undefined,
 ): () => void {
   if (typeof document === 'undefined') return () => undefined
 
@@ -910,13 +945,125 @@ function installRewindEntries(
     return fillComposerEditable(text)
   }
 
-  /** 用 Enter 提交 composer（就地重发的最后一步）。 */
-  const submitComposer = (): boolean => {
-    const editable = document.querySelector<HTMLElement>('[data-composer-input]')
-    if (editable === null) return false
-    editable.focus()
-    editable.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
-    return true
+  const composerOf = (sessionId: string): ComposerFace | undefined => {
+    const conversation = getConversation() as { input?: { for(scope: unknown): ComposerFace } } | undefined
+    const scope = sessions.scope?.(sessionId)
+    return scope === undefined ? undefined : conversation?.input?.for(scope)
+  }
+
+  const resendControllers = new Map<string, AbortController>()
+
+  const resend = async (sessionId: string, seq: number, textOverride?: string): Promise<void> => {
+    if (resendControllers.has(sessionId)) throw new Error('该会话正在重试，请稍候')
+    const composer = composerOf(sessionId)
+    const binding = sessions.binding(sessionId)
+    if (composer === undefined || binding?.eventSource?.subscribe === undefined) {
+      throw new Error('重试所需的会话接口未就绪，原消息已保留')
+    }
+    const text = textOverride ?? messageTextAt(chatOf({ sessionId }), seq)
+    if (text === undefined || text.trim() === '') throw new Error('无法读取原提示词，原消息已保留')
+    const originalDraft = composer.state.getSnapshot()
+    if (originalDraft.draft.trim() !== '' || originalDraft.attachmentIds.length > 0) {
+      throw new Error('请先保存或发送输入框中的草稿，再重试')
+    }
+    const controller = new AbortController()
+    resendControllers.set(sessionId, controller)
+    let staged = false
+    try {
+      const model = await getModelDirectory(sessionId)?.load()
+      if (model?.routable === false) {
+        throw new Error(`当前模型 ${model.current?.model ?? ''} 不可用，请重新选择模型。原消息已保留`)
+      }
+      if (model?.error) throw new Error(model.error)
+      if (disposed || controller.signal.aborted || currentSessionId(sessions) !== sessionId) return
+      if (composer.state.getSnapshot().draftRev !== originalDraft.draftRev) {
+        throw new Error('输入框草稿已变化，原消息已保留')
+      }
+      composer.setDraft(text)
+      staged = true
+      const draft = composer.state.getSnapshot()
+      if (!await rewindAndRefillSession(sessionId, seq, 'chat', undefined, text, false)) {
+        throw new Error('回退失败，提示词已保留在输入框')
+      }
+      if (disposed || controller.signal.aborted) return
+      if (composer.state.getSnapshot().draftRev !== draft.draftRev) {
+        throw new Error('输入框草稿已变化，已保留当前草稿，请确认后发送')
+      }
+      const requestId = crypto.randomUUID()
+      // 接纳入队不代表消息已进入对话；保留草稿直到观察到本次 user/message。
+      let finish!: (error?: Error) => void
+      const recorded = new Promise<void>((resolve, reject) => {
+        finish = error => error === undefined ? resolve() : reject(error)
+      })
+      const check = (): void => {
+        let activeTurn: number | undefined
+        let claimedTurn: number | undefined
+        let queuedAt: number | undefined
+        for (const entry of binding.eventSource.getSnapshot().entries) {
+          if (entry.type !== 'event') continue
+          const event = entry.event
+          if (event.type === 'user/message' && event.data.source?.rpcId === requestId) {
+            finish()
+            return
+          }
+          if (event.type === 'turn/start') activeTurn = event.data.turn
+          if (event.type === 'agent/inbox/spliced' && event.data.target === 'next-turn') {
+            const start = event.data.start ?? 0
+            const removed = event.data.removedCount ?? 0
+            const inserted = event.data.inserted ?? []
+            if (queuedAt !== undefined) {
+              if (queuedAt >= start && queuedAt < start + removed) {
+                if (event.data.outcome === 'canceled') {
+                  finish(new Error('重发消息已从队列取消，提示词已保留'))
+                  return
+                }
+                claimedTurn = activeTurn
+                queuedAt = undefined
+              } else if (queuedAt >= start) queuedAt += inserted.length - removed
+            }
+            const index = inserted.findIndex(message => message.source?.rpcId === requestId)
+            if (index >= 0) queuedAt = start + index
+          }
+          if (claimedTurn !== undefined && event.type === 'turn/end' && event.data.turn === claimedTurn) {
+            finish(new Error(event.data.reason?.error?.message ?? '本轮未保存提示词，请重试'))
+            return
+          }
+        }
+      }
+      const unsubscribe = binding.eventSource.subscribe(check)
+      const abort = (): void => finish(new Error('重试已取消，提示词已保留'))
+      controller.signal.addEventListener('abort', abort, { once: true })
+      let timer: ReturnType<typeof setTimeout>
+      const timedOut = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error('重试结果待确认，提示词已保留；请检查对话和队列后再发送'))
+          controller.abort()
+        }, 30_000)
+      })
+      try {
+        // 同时等待接纳与持久化，运行提前失败也会进入同一错误恢复路径。
+        const accepted = binding.session.prompt([{ type: 'text', text }], 'queue', controller.signal, requestId)
+          .then(result => {
+            if (!result.ok) throw new Error(result.error?.message ?? '提示词发送失败')
+          })
+        await Promise.race([Promise.all([accepted, recorded]), timedOut])
+        if (!disposed && composer.state.getSnapshot().draftRev === draft.draftRev) composer.setDraft('')
+      } finally {
+        clearTimeout(timer!)
+        unsubscribe()
+        controller.signal.removeEventListener('abort', abort)
+      }
+    } catch (error) {
+      if (!disposed) {
+        const current = composer.state.getSnapshot()
+        if (staged && current.draft.trim() === '' && current.attachmentIds.length === 0) composer.setDraft(text)
+        composer.notify('error', `重试失败：${toErrorMessage(error)}${staged ? `\n已保留重试提示词：${text}` : ''}`)
+      }
+      throw error
+    } finally {
+      controller.abort()
+      resendControllers.delete(sessionId)
+    }
   }
 
   // ── 行内编辑器:点 ✎ 时消息原位变输入框,确定时才回退并发送改后文本 ──
@@ -1007,19 +1154,12 @@ function installRewindEntries(
       hint.textContent = ''
       void (async () => {
         // 确认时才回退:撤回该消息及其后,回填改后文本并自动发送。
-        const ok = await rewindAndRefillSession(sessionId, cp.seq, 'chat', undefined, text)
-        if (ok) {
-          closeEditor()
-          submitComposer()
-        } else {
-          confirm.disabled = false
-          confirm.textContent = '确定'
-          hint.textContent = '回退失败，请重试'
-        }
-      })().catch(() => {
+        await resend(sessionId, cp.seq, text)
+        closeEditor()
+      })().catch((error) => {
         confirm.disabled = false
         confirm.textContent = '确定'
-        hint.textContent = '回退失败，请重试'
+        hint.textContent = toErrorMessage(error)
       })
     }
     confirm.addEventListener('click', runConfirm)
@@ -1073,7 +1213,7 @@ function installRewindEntries(
    * 就地回退并回填（浮层确认后的执行体）：引擎命令 → 等 marker 结局 → 把
    * 目标消息文本回填 composer。返回是否成功回填。
    */
-  const rewindAndRefillSession = async (sessionId: string, seq: number, mode: 'chat' | 'both', planId?: string, textOverride?: string): Promise<boolean> => {
+  const rewindAndRefillSession = async (sessionId: string, seq: number, mode: 'chat' | 'both', planId?: string, textOverride?: string, refill = true): Promise<boolean> => {
     const binding = sessions.binding(sessionId)
     if (binding === undefined) return false
     const engineFace = { sessionId, command: (line: string) => binding.session.command(line) }
@@ -1122,6 +1262,7 @@ function installRewindEntries(
     }
     // 用户可能在回退期间切换会话：只回填回退发生的会话。
     if (currentSessionId(sessions) !== sessionId) return false
+    if (!refill) return true
     // 编辑确认后回填改后文本;常规回退回填原文。
     const text = textOverride ?? messageTextAt(chatOf({ sessionId }), seq)
     if (text === undefined) return false
@@ -1136,15 +1277,8 @@ function installRewindEntries(
     }
   }
 
-  /**
-   * 就地重发（刷新/重新生成的新实现）：回退到目标消息 → 文本回填 →
-   * 自动 Enter 重发。不再 fork：会话 id 不变、无切换/归档/模型同步。
-   */
-  const regenerateInPlace = async (sessionId: string, seq: number): Promise<void> => {
-    if (await rewindAndRefillSession(sessionId, seq, 'chat')) {
-      submitComposer()
-    }
-  }
+  /** 刷新和重新生成共用保留草稿、等待消息入账的重发管线。 */
+  const regenerateInPlace = (sessionId: string, seq: number): Promise<void> => resend(sessionId, seq)
   regenerateHook = regenerateInPlace
 
   /** pointerdown 预取（RPC）：浮层打开时直接以落定态渲染，消除「检查中」闪烁。 */
@@ -1383,6 +1517,8 @@ function installRewindEntries(
 
   return () => {
     disposed = true
+    for (const controller of resendControllers.values()) controller.abort()
+    regenerateHook = undefined
     observer.disconnect()
     unsubscribe?.()
     closePopover()
@@ -1460,12 +1596,44 @@ function installSessionMenuDelete(
       const text = item.textContent?.trim().toLocaleLowerCase() ?? ''
       return text.includes('归档会话') || text.includes('archive session')
     })
-    if (!archiveItem || archiveItem.parentElement?.querySelector('[data-dsh-session-delete="true"]')) return
+    const menu = archiveItem?.closest<HTMLElement>('[role="menu"]') ?? null
+    if (!archiveItem || !menu) return
 
-    const deleteItem = archiveItem.cloneNode(true) as HTMLElement
-    deleteItem.setAttribute('data-dsh-session-delete', 'true')
+    // MenuItemButton 把每个按钮包在 itemWrap 里，真正的列表是 menu 内带
+    // role="presentation" 的视口容器（footer 在视口之外）。
+    const viewport = archiveItem.closest<HTMLElement>('[role="presentation"]')
+    const list = viewport !== null && menu.contains(viewport) ? viewport : menu
+
+    // 删除项固定在菜单最末位。内置项按 order 排序（“复制 Session ID”在“归档会话”
+    // 之后），其他插件也可能追加菜单项，所以每次同步都把已存在的删除项挪回末尾。
+    const existing = Array.from(list.children).find(
+      (child) => child instanceof HTMLElement && child.getAttribute('data-dsh-session-delete') === 'true',
+    ) as HTMLElement | undefined
+    if (existing) {
+      if (list.lastElementChild !== existing) list.append(existing)
+      return
+    }
+
+    // 菜单重挂后旧容器里的残留项先清掉，避免页面上同时出现多个“删除会话”。
+    document.querySelectorAll('[data-dsh-session-delete="true"]').forEach((element) => element.remove())
+
+    // 连同 itemWrap 一起克隆，保持与内置菜单项完全一致的布局结构；只在父节点
+    // 确实只包着这一个菜单项时这样做，避免误克隆整个列表容器。
+    const archiveWrapper = archiveItem.parentElement
+    const cloneWrapper = archiveWrapper !== null && archiveWrapper.querySelectorAll('[role="menuitem"]').length === 1
+    const deleteNode = (cloneWrapper ? archiveWrapper : archiveItem).cloneNode(true) as HTMLElement
+    const deleteItem = deleteNode.getAttribute('role') === 'menuitem'
+      ? deleteNode
+      : deleteNode.querySelector<HTMLElement>('[role="menuitem"]')
+    if (!deleteItem) return
+    deleteNode.setAttribute('data-dsh-session-delete', 'true')
     deleteItem.setAttribute('aria-label', '删除会话')
     deleteItem.removeAttribute('aria-current')
+    // 归档项的 ⌥⌘A 快捷键不属于删除，连同 aria-keyshortcuts 一起去掉，避免误导
+    deleteItem.removeAttribute('aria-keyshortcuts')
+    for (const key of deleteItem.querySelectorAll('kbd')) {
+      key.closest('span[aria-hidden="true"]')?.remove()
+    }
     replaceMenuLabel(deleteItem, '删除会话')
     replaceMenuIcon(deleteItem)
     deleteItem.style.color = 'var(--dsw-alias-state-error-primary, #d92d20)'
@@ -1483,7 +1651,7 @@ function installSessionMenuDelete(
       }
     }, true)
 
-    archiveItem.insertAdjacentElement('afterend', deleteItem)
+    list.append(deleteNode)
   }
 
   document.addEventListener('pointerdown', onDocumentPointerDown, true)

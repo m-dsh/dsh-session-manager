@@ -178,7 +178,7 @@ export function SessionManagerSection(props: Record<string, unknown>): React.Rea
       ),
       row(
         '删除会话',
-        '在会话记录的下拉菜单中，于“归档会话”下方添加“删除会话”。',
+        '在会话记录的下拉菜单末尾添加“删除会话”（始终为最后一项）。',
         settings.sessionDelete,
         'sessionDeleteEnabled',
       ),
