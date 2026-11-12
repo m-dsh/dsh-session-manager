@@ -32,10 +32,10 @@
     },
     "./package.json": "./package.json"
   },
+  "engines": {
+    "dsh": ">=0.2.1-rc.1 <0.3.0-0"
+  },
   "dsh": {
-    "engines": {
-      "dsh": ">=0.2.1-rc.1 <0.3.0-0"
-    },
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
